@@ -1,12 +1,9 @@
 import struct
 import numpy as np
- 
- 
+
 """
-                  IO Utils
+IO Utils
 """
- 
- 
 def read_fbin(filename, start_idx=0, chunk_size=None):
     """ Read *.fbin file that contains float32 vectors
     Args:
