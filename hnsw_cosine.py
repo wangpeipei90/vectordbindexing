@@ -2,6 +2,7 @@
 
 import math
 import random
+import queue
 import numpy as np
 from collections import defaultdict
 from dataclasses import dataclass
@@ -375,19 +376,17 @@ class HNSWIndex:
         steps = []
         current = entry_id
         best_dist = self.distance(vec, self.items[current].vector)
-        steps.append({"layer": layer, "from": None, "to": current, "dist": best_dist, "reason": "enter-layer"})
+        steps.append(current)
         improved = True
         while improved:
             improved = False
             for nb in self.neighbours[layer][current]:
                 dist = self.distance(vec, self.items[nb].vector)
-                steps.append({"layer": layer, "from": current, "to": nb, "dist": dist, "reason": "probe-neighbour"})
+                steps.append(nb)
                 if dist < best_dist:
                     best_dist = dist
                     current = nb
-                    steps.append({"layer": layer, "from": None, "to": current, "dist": best_dist, "reason": "move-closer"})
                     improved = True
-        steps.append({"layer": layer, "from": None, "to": current, "dist": best_dist, "reason": "greedy-stop"})
         return current, steps
 
     def _search_layer(self, vec: np.ndarray, entry_id: int, layer: int, ef: int) -> List[int]:
@@ -432,21 +431,14 @@ class HNSWIndex:
         heapq.heappush(candidates, (dist_entry, entry_id))
         heapq.heappush(result, (-dist_entry, entry_id))
         visited.add(entry_id)
-        steps.append({"layer": layer, "event": "push-entry", "id": entry_id, "dist": dist_entry})
+        steps.append(entry_id)
 
         found = False
         while candidates:
             dist_curr, curr = heapq.heappop(candidates)
             worst_dist = -result[0][0] if result else math.inf
-            steps.append({"layer": layer, "event": "pop-candidate", "id": curr, "dist": dist_curr, "worst": worst_dist})
-
-            if curr == target_id:
-                found = True
-                steps.append({"layer": layer, "event": "target-popped", "id": curr, "dist": dist_curr})
-                break
 
             if dist_curr > worst_dist:
-                steps.append({"layer": layer, "event": "stop-criterion", "reason": "no-improvement"})
                 break
 
             for nb in self.neighbours[layer][curr]:
@@ -454,17 +446,18 @@ class HNSWIndex:
                     continue
                 visited.add(nb)
                 d = self.distance(vec, self.items[nb].vector)
-                # 如果首次遇到 target，记录并继续常规逻辑入堆
-                if nb == target_id:
-                    steps.append({"layer": layer, "event": "target-discovered", "id": nb, "dist": d})
+                steps.append(nb)
                 if len(result) < ef or d < worst_dist:
                     heapq.heappush(candidates, (d, nb))
                     heapq.heappush(result, (-d, nb))
-                    steps.append({"layer": layer, "event": "push", "id": nb, "dist": d})
                     if len(result) > ef:
                         popped = heapq.heappop(result)
-                        steps.append({"layer": layer, "event": "prune-result", "id": popped[1], "dist": -popped[0]})
                         worst_dist = -result[0][0]
+                if nb == target_id:
+                    found = True
+                    break
+            if found:
+                break
         return steps, found
 
     def query(self, vector: np.ndarray, k: int) -> List[Tuple[int, float]]:
@@ -496,13 +489,8 @@ class HNSWIndex:
         vec = _unit_norm(np.asarray(vector, dtype=np.float32))
         trace = []
 
-        # 1) Greedy descent from top to bottom, recording steps
+        # 1) run best-first with trace until target first appears/popped
         curr = self.entry_point
-        for l in range(self.max_level, 0, -1):
-            curr, steps = self._search_layer_greedy_trace(vec, curr, l)
-            trace.extend(steps)
-
-        # 2) At layer 0, run best-first with trace until target first appears/popped
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
         steps, found = self._search_layer_trace_until_target(vec, curr, 0, eff, target_id)
         trace.extend(steps)
@@ -563,16 +551,57 @@ class HNSWIndex:
         def has_capacity(u: int) -> bool:
             return (max_new_edges_per_node is None) or (added_per_node[u] < max_new_edges_per_node)
 
-        def can_add(u: int, v: int) -> bool:
+        def can_add(u: int, v: int):
             # 度预算
             if (max_new_edges_per_node is not None) and ( (added_per_node[u] >= max_new_edges_per_node) or (added_per_node[v] >= max_new_edges_per_node) ):
                 stats["pruned_by_cap"] += 1
-                return False
-            # 去重
-            if dedup and v in self.neighbours[layer][u]:
-                stats["skipped_existing"] += 1
-                return False
-            return True
+                return False, 0
+            for layer_id in range(0, self.max_level):
+                if u not in self.neighbours[layer_id]:
+                    continue
+                # 去重
+                if v in self.neighbours[layer_id][u]:
+                    stats["skipped_existing"] += 1
+                    return False, layer_id
+                # 度限制：通过u能够k跳内去到v
+                can_add = True
+                degree_queue = queue.Queue()
+                sub_degree_queue = queue.Queue()
+                explore_depth = 3
+                degree_queue.put({"layer":layer_id, "id": u})
+                while degree_queue.empty() and sub_degree_queue.empty():
+                    if explore_depth % 2 == 1:
+                        m = degree_queue.get()
+                        for x in self.neighbours[m["layer"]][m["id"]]:
+                            for ano_layer in range(0, self.max_level):
+                                if x not in self.neighbours[ano_layer]:
+                                    continue
+                                if v in self.neighbours[ano_layer][x]:
+                                    can_add = False
+                                    break
+                                sub_degree_queue.put({"layer":ano_layer, "id": x})
+                    else:
+                        m = sub_degree_queue.get()
+                        for x in self.neighbours[m["layer"]][m["id"]]:
+                            for ano_layer in range(0, self.max_level):
+                                if x not in self.neighbours[ano_layer]:
+                                    continue
+                                if v in self.neighbours[ano_layer][x]:
+                                    can_add = False
+                                    break
+                                if explore_depth > 0:
+                                    degree_queue.put({"layer":ano_layer, "id": x})
+                    if not can_add:
+                        break
+                    if degree_queue.empty() or sub_degree_queue.empty():
+                        explore_depth -= 1
+
+                if can_add:
+                    return True, layer_id
+                else:
+                    return False, layer_id
+
+            return False, layer
 
         def _dist(u: int, v: int) -> float:
             # 若类里提供了度量函数则用之，否则退化为“同 rank 下不做度量比较”（返回+∞使得不过滤）
@@ -580,10 +609,10 @@ class HNSWIndex:
                 return float(self._dist(u, v))
             return float("inf")
 
-        def _add_pair(u: int, v: int, reset_):
+        def _add_pair(u: int, v: int, reset_, layer_id):
             # 双向加
-            self._add_QD_link(u, v, layer, reset_)
-            self._add_QD_link(v, u, layer, reset_)
+            self._add_QD_link(u, v, layer_id, reset_)
+            self._add_QD_link(v, u, layer_id, reset_)
             added_per_node[u] += 1
             added_per_node[v] += 1
             stats["pairs_added"] += 1
@@ -628,8 +657,9 @@ class HNSWIndex:
                 hub = ids[0]
                 for v in ids[1:]:
                     stats["pairs_considered"] += 1
-                    if can_add(hub, v):
-                        _add_pair(hub, v, reset_)
+                    can_add_, layer_id = can_add(hub, v)
+                    if can_add_:
+                        _add_pair(hub, v, reset_, layer_id)
 
             elif strategy == "clique":
                 n = len(ids)
@@ -637,8 +667,9 @@ class HNSWIndex:
                     for j in range(i + 1, n):
                         u, v = ids[i], ids[j]
                         stats["pairs_considered"] += 1
-                        if can_add(u, v):
-                            _add_pair(u, v, reset_)
+                        can_add_, layer_id = can_add(u, v)
+                        if can_add_:
+                            _add_pair(u, v, reset_, layer_id)
 
             elif strategy == "projection":
                 # 1) pivot 选 top1（RoarGraph 中为“最邻近的 base 节点”）
@@ -651,8 +682,9 @@ class HNSWIndex:
                 # 3) 连接：pivot ↔ picked
                 for v in picked:
                     stats["pairs_considered"] += 1
-                    if can_add(pivot, v):
-                        _add_pair(pivot, v, reset_)
+                    can_add_, layer_id = can_add(pivot, v)
+                    if can_add_:
+                        _add_pair(pivot, v, reset_, layer_id)
                     else:
                         stats["skipped_occluded"] += 0  # 占位，保持字段
 
@@ -662,7 +694,8 @@ class HNSWIndex:
                     limit = min(chain_extra, len(picked) - 1)
                     for i in range(limit):
                         u, v = picked[i], picked[i + 1]
-                        if can_add(u, v):
+                        can_add_, layer_id = can_add(u, v)
+                        if can_add_:
+                            _add_pair(u, v, reset_, layer_id)
                             stats["pairs_considered"] += 1
-                            _add_pair(u, v, reset_)
         return stats
