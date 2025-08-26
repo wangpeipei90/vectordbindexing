@@ -85,6 +85,14 @@ class HNSWIndex:
         self.items: Dict[int, Node] = {}
         # adjacency lists per layer: layer -> id -> list of neighbour ids
         self.neighbours: Dict[int, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
+        # 新增：边的标记信息，用于跟踪 cross distribution 边
+        self.edge_flags: Dict[int, Dict[int, Dict[int, str]]] = defaultdict(lambda: defaultdict(dict))
+        # 新增：统计信息
+        self.cross_distribution_stats = {
+            "total_cross_edges": 0,
+            "deleted_cross_edges": 0,
+            "cross_edges_by_query": defaultdict(int)
+        }
         self.max_level: int = -1
         self.entry_point: Optional[int] = None
         self._id_counter = 0
@@ -312,6 +320,42 @@ class HNSWIndex:
                 distances = [(n, self.distance(self.items[source].vector, self.items[n].vector))
                              for n in nbrs]
                 distances.sort(key=lambda x: x[1])
+                # 记录被删除的 cross distribution 边
+                deleted_neighbors = [n for n, _ in distances[self.M:]]
+                for deleted_nb in deleted_neighbors:
+                    if self.edge_flags[layer][source].get(deleted_nb) == "cross_distribution":
+                        self.cross_distribution_stats["deleted_cross_edges"] += 1
+                        # 从标记中移除
+                        if deleted_nb in self.edge_flags[layer][source]:
+                            del self.edge_flags[layer][source][deleted_nb]
+                
+                self.neighbours[layer][source] = [n for n, _ in distances[:self.M]]
+
+    def _add_cross_distribution_link(self, source: int, dest: int, layer: int, query_id: Optional[int] = None) -> None:
+        """Add a cross distribution link with marking."""
+        nbrs = self.neighbours[layer][source]
+        if dest not in nbrs:
+            nbrs.append(dest)
+            # 标记为 cross distribution 边
+            self.edge_flags[layer][source][dest] = "cross_distribution"
+            self.cross_distribution_stats["total_cross_edges"] += 1
+            if query_id is not None:
+                self.cross_distribution_stats["cross_edges_by_query"][query_id] += 1
+            
+            if len(nbrs) > self.M:
+                # 计算到 source 的距离并保留最近的 M 个
+                distances = [(n, self.distance(self.items[source].vector, self.items[n].vector))
+                             for n in nbrs]
+                distances.sort(key=lambda x: x[1])
+                # 记录被删除的 cross distribution 边
+                deleted_neighbors = [n for n, _ in distances[self.M:]]
+                for deleted_nb in deleted_neighbors:
+                    if self.edge_flags[layer][source].get(deleted_nb) == "cross_distribution":
+                        self.cross_distribution_stats["deleted_cross_edges"] += 1
+                        # 从标记中移除
+                        if deleted_nb in self.edge_flags[layer][source]:
+                            del self.edge_flags[layer][source][deleted_nb]
+                
                 self.neighbours[layer][source] = [n for n, _ in distances[:self.M]]
 
     def _add_QD_link(self, source: int, dest: int, layer: int, reset_: bool) -> None:
@@ -324,6 +368,15 @@ class HNSWIndex:
             distances = [(n, self.distance(self.items[source].vector, self.items[n].vector))
                             for n in nbrs]
             distances.sort(key=lambda x: x[1])
+            # 记录被删除的 cross distribution 边
+            deleted_neighbors = [n for n, _ in distances[self.M:]]
+            for deleted_nb in deleted_neighbors:
+                if self.edge_flags[layer][source].get(deleted_nb) == "cross_distribution":
+                    self.cross_distribution_stats["deleted_cross_edges"] += 1
+                    # 从标记中移除
+                    if deleted_nb in self.edge_flags[layer][source]:
+                        del self.edge_flags[layer][source][deleted_nb]
+            
             self.neighbours[layer][source] = [n for n, _ in distances[:self.M]]
 
     def _dist(self, u: int, v: int) -> float:
@@ -496,13 +549,139 @@ class HNSWIndex:
         trace.extend(steps)
 
         # 3) Optionally finish a normal search to return a final top-k list
-        # （这部分不影响“找到 target 的时刻”，仅用于返回参考的 top-k）
+        # （这部分不影响"找到 target 的时刻"，仅用于返回参考的 top-k）
         cands = self._search_layer(vec, curr, 0, eff)
         dists = [(cid, self.distance(vec, self.items[cid].vector)) for cid in cands]
         dists.sort(key=lambda x: x[1])
         topk = dists[:k]
 
         return {"found": found, "trace": trace, "final_candidates": topk}
+
+    # ====== RoarGraph 风格的 Cross Distribution 边构建 ======
+    def build_cross_distribution_edges(
+        self,
+        query_topk: Dict[int, list[int]],
+        layer: int = 0,
+        max_new_edges_per_node: int = 4,
+        occlude_alpha: float = 1.0,
+        use_metric: bool = True,
+        chain_extra: int = 0,
+        strict_exist_check: bool = True,
+    ) -> dict:
+        """
+        基于 RoarGraph 论文的方法构建 cross distribution 边
+        只在第0层构建，使用投影策略来避免边的冗余
+        """
+        if layer != 0:
+            return {"error": "Cross distribution edges only supported on layer 0"}
+        
+        if layer < 0 or layer > self.max_level:
+            return {"error": "Invalid layer"}
+
+        # 每个节点本次新增计数（限流）
+        from collections import defaultdict
+        added_per_node: Dict[int, int] = defaultdict(int)
+
+        stats = {
+            "pairs_considered": 0,
+            "pairs_added": 0,
+            "skipped_missing": 0,
+            "skipped_existing": 0,
+            "pruned_by_cap": 0,
+            "skipped_occluded": 0,
+        }
+
+        def has_capacity(u: int) -> bool:
+            return (max_new_edges_per_node is None) or (added_per_node[u] < max_new_edges_per_node)
+
+        def can_add(u: int, v: int):
+            # 度预算
+            if (max_new_edges_per_node is not None) and ( (added_per_node[u] >= max_new_edges_per_node) or (added_per_node[v] >= max_new_edges_per_node) ):
+                stats["pruned_by_cap"] += 1
+                return False
+            # 检查是否已存在边
+            if v in self.neighbours[layer][u]:
+                stats["skipped_existing"] += 1
+                return False
+            return True
+
+        def _dist(u: int, v: int) -> float:
+            # 若类里提供了度量函数则用之，否则退化为"同 rank 下不做度量比较"（返回+∞使得不过滤）
+            if use_metric and hasattr(self, "_dist"):
+                return float(self._dist(u, v))
+            return float("inf")
+
+        def _add_cross_pair(u: int, v: int, query_id: int):
+            # 双向加 cross distribution 边
+            self._add_cross_distribution_link(u, v, layer, query_id)
+            self._add_cross_distribution_link(v, u, layer, query_id)
+            added_per_node[u] += 1
+            added_per_node[v] += 1
+            stats["pairs_added"] += 1
+
+        # --- RoarGraph 投影策略的核心：AcquireNeighbors ---
+        def acquire_neighbors(pivot: int, candidates: list[int], cap: int) -> list[int]:
+            """
+            从 candidates 里选一组"对 pivot 有帮助且相互不过度遮挡"的点，最多 cap 个。
+            规则：按 candidates 顺序（≈按与 query 的距离从小到大），
+                仅当 对所有已选 r:  dist(c, r) > occlude_alpha * dist(c, pivot) 时保留 c。
+            """
+            picked: list[int] = []
+            for c in candidates:
+                if c == pivot:
+                    continue
+                if cap is not None and len(picked) >= cap:
+                    break
+                if not has_capacity(pivot) or not has_capacity(c):
+                    continue
+                ok = True
+                if use_metric and picked:
+                    dcp = _dist(c, pivot)
+                    # 若没有度量（inf），不会触发剔除；有度量时执行遮挡判断
+                    if dcp != float("inf"):
+                        for r in picked:
+                            if _dist(c, r) <= occlude_alpha * dcp:
+                                ok = False
+                                break
+                if ok:
+                    picked.append(c)
+            return picked
+
+        for query_id, topk in query_topk.items():
+            # 清洗：只保留在索引中的 id
+            ids = [nid for nid in topk if nid in self.items]
+            if len(ids) < len(topk):
+                stats["skipped_missing"] += (len(topk) - len(ids))
+            if len(ids) <= 1:
+                continue
+
+            # RoarGraph 投影策略
+            # 1) pivot 选 top1（RoarGraph 中为"最邻近的 base 节点"）
+            pivot = ids[0]
+            cand = ids[1:]  # 如有 query 距离，可在外部保证 topk 已按距离升序
+
+            # 2) 邻域感知筛选（多样性/遮挡规则）
+            picked = acquire_neighbors(pivot, cand, max_new_edges_per_node)
+
+            # 3) 连接：pivot ↔ picked
+            for v in picked:
+                stats["pairs_considered"] += 1
+                if can_add(pivot, v):
+                    _add_cross_pair(pivot, v, _qid)
+                else:
+                    stats["skipped_occluded"] += 1
+
+            # 4) 可选的小幅"链式"增强：在 picked 里顺次连少量边，提升可达性
+            if chain_extra > 0 and len(picked) > 1:
+                # 只连前若干条顺次对
+                limit = min(chain_extra, len(picked) - 1)
+                for i in range(limit):
+                    u, v = picked[i], picked[i + 1]
+                    if can_add(u, v):
+                        _add_cross_pair(u, v, _qid)
+                        stats["pairs_considered"] += 1
+
+        return stats
 
     # ====== Edge augmentation from offline query→topk ======
     def augment_from_query_topk(
@@ -520,11 +699,11 @@ class HNSWIndex:
         - projection: 邻域感知投影（RoarGraph 风格的轻量实现）
         * pivot = top1
         * 候选按 rank 顺序（如有 self._dist 可做更稳排序）
-        * occlusion 规则：仅保留对 pivot 更“独立”的候选，避免互相遮挡
+        * occlusion 规则：仅保留对 pivot 更"独立"的候选，避免互相遮挡
         可调属性（若未设置则使用默认）:
         - self.qd_occlude_alpha: float, 默认 1.0（=严格版 occlusion）
         - self.qd_use_metric: bool, 默认 True 且要求存在 self._dist(u,v)
-        - self.qd_chain: int, 默认 0；>0 时对已选邻居做少量“链式”互连以增强可达
+        - self.qd_chain: int, 默认 0；>0 时对已选邻居做少量"链式"互连以增强可达
         """
         assert strategy in ("star", "clique", "projection")
         if layer < 0 or layer > self.max_level:
@@ -604,7 +783,7 @@ class HNSWIndex:
             return False, layer
 
         def _dist(u: int, v: int) -> float:
-            # 若类里提供了度量函数则用之，否则退化为“同 rank 下不做度量比较”（返回+∞使得不过滤）
+            # 若类里提供了度量函数则用之，否则退化为"同 rank 下不做度量比较"（返回+∞使得不过滤）
             if use_metric and hasattr(self, "_dist"):
                 return float(self._dist(u, v))
             return float("inf")
@@ -620,7 +799,7 @@ class HNSWIndex:
         # --- projection 策略的核心：AcquireNeighbors（RoarGraph Alg.3 的轻量实现）---
         def acquire_neighbors(pivot: int, candidates: list[int], cap: int) -> list[int]:
             """
-            从 candidates 里选一组“对 pivot 有帮助且相互不过度遮挡”的点，最多 cap 个。
+            从 candidates 里选一组"对 pivot 有帮助且相互不过度遮挡"的点，最多 cap 个。
             规则：按 candidates 顺序（≈按与 query 的距离从小到大），
                 仅当 对所有已选 r:  dist(c, r) > occlude_alpha * dist(c, pivot) 时保留 c。
             """
@@ -672,7 +851,7 @@ class HNSWIndex:
                             _add_pair(u, v, reset_, layer_id)
 
             elif strategy == "projection":
-                # 1) pivot 选 top1（RoarGraph 中为“最邻近的 base 节点”）
+                # 1) pivot 选 top1（RoarGraph 中为"最邻近的 base 节点"）
                 pivot = ids[0]
                 cand = ids[1:]  # 如有 query 距离，可在外部保证 topk 已按距离升序
 
@@ -688,7 +867,7 @@ class HNSWIndex:
                     else:
                         stats["skipped_occluded"] += 0  # 占位，保持字段
 
-                # 4) 可选的小幅“链式”增强：在 picked 里顺次连少量边，提升可达性（RoarGraph 的 connectivity enhancement 的轻量影子）
+                # 4) 可选的小幅"链式"增强：在 picked 里顺次连少量边，提升可达性（RoarGraph 的 connectivity enhancement 的轻量影子）
                 if chain_extra > 0 and len(picked) > 1:
                     # 只连前若干条顺次对
                     limit = min(chain_extra, len(picked) - 1)
@@ -699,3 +878,20 @@ class HNSWIndex:
                             _add_pair(u, v, reset_, layer_id)
                             stats["pairs_considered"] += 1
         return stats
+
+    def get_cross_distribution_stats(self) -> dict:
+        """获取 cross distribution 边的统计信息"""
+        return {
+            "total_cross_edges": self.cross_distribution_stats["total_cross_edges"],
+            "deleted_cross_edges": self.cross_distribution_stats["deleted_cross_edges"],
+            "active_cross_edges": self.cross_distribution_stats["total_cross_edges"] - self.cross_distribution_stats["deleted_cross_edges"],
+            "cross_edges_by_query": dict(self.cross_distribution_stats["cross_edges_by_query"])
+        }
+
+    def reset_cross_distribution_stats(self) -> None:
+        """重置 cross distribution 统计信息"""
+        self.cross_distribution_stats = {
+            "total_cross_edges": 0,
+            "deleted_cross_edges": 0,
+            "cross_edges_by_query": defaultdict(int)
+        }
