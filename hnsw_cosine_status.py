@@ -527,26 +527,54 @@ class HNSWIndex:
         return dists[:k]
 
     # ===== Public API: search with steps to reach a target =====
-    def search_steps_to_target(self, vector: np.ndarray, target_id: int, k: int = 10, ef: Optional[int] = None):
+    def search_steps_to_target(self, vector: np.ndarray, target_id: int, k: int = 10, ef: Optional[int] = None, 
+                              verbose: bool = False, analyze_phases: bool = False):
         """Run a query and return the detailed navigation steps until the target is first reached.
+        
+        Parameters:
+        -----------
+        vector : np.ndarray
+            Query vector
+        target_id : int
+            Target node ID to search for
+        k : int
+            Number of top-k results to return
+        ef : Optional[int]
+            Search beam width, if None uses self.ef_search
+        verbose : bool
+            Whether to print detailed distance information
+        analyze_phases : bool
+            Whether to analyze and print phase information
+            
         Returns:
-            {
-              "found": bool,
-              "trace": [ ... step dicts ... ],
-              "final_candidates": List[Tuple[id, dist]]  # top-k at the end (optional)
-            }
+        --------
+        dict with keys:
+            "found": bool,
+            "trace": [ ... step dicts ... ],
+            "final_candidates": List[Tuple[id, dist]]  # top-k at the end (optional)
+            "phase_analysis": dict  # 如果 analyze_phases=True
         """
         if not self.items:
             return {"found": False, "trace": [], "final_candidates": []}
 
         vec = _unit_norm(np.asarray(vector, dtype=np.float32))
         trace = []
+        phase_analysis = {}
 
         # 1) run best-first with trace until target first appears/popped
         curr = self.entry_point
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
-        steps, found = self._search_layer_trace_until_target(vec, curr, 0, eff, target_id)
-        trace.extend(steps)
+        
+        if analyze_phases:
+            # 详细分析搜索阶段
+            steps, found, phase_info = self._search_layer_trace_until_target_with_phases(
+                vec, curr, 0, eff, target_id, verbose
+            )
+            trace.extend(steps)
+            phase_analysis = phase_info
+        else:
+            steps, found = self._search_layer_trace_until_target(vec, curr, 0, eff, target_id)
+            trace.extend(steps)
 
         # 3) Optionally finish a normal search to return a final top-k list
         # （这部分不影响"找到 target 的时刻"，仅用于返回参考的 top-k）
@@ -555,7 +583,154 @@ class HNSWIndex:
         dists.sort(key=lambda x: x[1])
         topk = dists[:k]
 
-        return {"found": found, "trace": trace, "final_candidates": topk}
+        result = {"found": found, "trace": trace, "final_candidates": topk}
+        if analyze_phases:
+            result["phase_analysis"] = phase_analysis
+            
+        return result
+
+    # ===== 新增：带阶段分析的搜索函数 =====
+    def _search_layer_trace_until_target_with_phases(self, vec: np.ndarray, entry_id: int, layer: int, 
+                                                   ef: int, target_id: int, verbose: bool = False):
+        """
+        带阶段分析的搜索函数，区分快速靠近阶段和 beam search 阶段
+        并统计每个阶段经过的 cross distribution 加速边
+        """
+        import heapq
+        
+        steps = []
+        visited: set[int] = set()
+        candidates: List[Tuple[float, int]] = []   # min-heap by dist
+        result: List[Tuple[float, int]] = []       # max-heap via negative dist
+        
+        # 阶段分析相关变量
+        phase_1_steps = []  # 第一阶段：top-1 持续变化
+        phase_2_steps = []  # 第二阶段：top-1 相对固定
+        current_top1 = entry_id
+        top1_stable_count = 0
+        top1_stable_threshold = 3  # top-1 连续保持不变的次数阈值
+        
+        # 加速边统计
+        phase_1_accel_edges = 0  # 第一阶段经过的加速边数
+        phase_2_accel_edges = 0  # 第二阶段经过的加速边数
+        
+        dist_entry = self.distance(vec, self.items[entry_id].vector)
+        heapq.heappush(candidates, (dist_entry, entry_id))
+        heapq.heappush(result, (-dist_entry, entry_id))
+        visited.add(entry_id)
+        steps.append(entry_id)
+        
+        if verbose:
+            print(f"起始点: {entry_id}, 距离: {dist_entry:.6f}")
+
+        found = False
+        while candidates:
+            dist_curr, curr = heapq.heappop(candidates)
+            worst_dist = -result[0][0] if result else math.inf
+
+            if dist_curr > worst_dist:
+                break
+
+            for nb in self.neighbours[layer][curr]:
+                if nb in visited:
+                    continue
+                visited.add(nb)
+                d = self.distance(vec, self.items[nb].vector)
+                steps.append(nb)
+                
+                # 检查是否经过 cross distribution 加速边
+                is_accel_edge = False
+                if layer in self.edge_flags and curr in self.edge_flags[layer]:
+                    if nb in self.edge_flags[layer][curr] and self.edge_flags[layer][curr][nb] == "cross_distribution":
+                        is_accel_edge = True
+                
+                if verbose:
+                    edge_type = "加速边" if is_accel_edge else "普通边"
+                    print(f"访问节点: {nb}, 距离: {d:.6f}, 当前最佳: {dist_curr:.6f}, 边类型: {edge_type}")
+                
+                if len(result) < ef or d < worst_dist:
+                    heapq.heappush(candidates, (d, nb))
+                    heapq.heappush(result, (-d, nb))
+                    if len(result) > ef:
+                        popped = heapq.heappop(result)
+                        worst_dist = -result[0][0]
+                
+                # 检查是否找到目标
+                if nb == target_id:
+                    found = True
+                    if verbose:
+                        print(f"找到目标节点: {target_id}, 距离: {d:.6f}")
+                    break
+                    
+                # 阶段分析：检查 top-1 是否发生变化
+                if result and result[0][1] != current_top1:
+                    # top-1 发生变化
+                    new_top1 = result[0][1]
+                    new_top1_dist = -result[0][0]
+                    if verbose:
+                        print(f"Top-1 变化: {current_top1} -> {new_top1}, 距离: {new_top1_dist:.6f}")
+                    
+                    current_top1 = new_top1
+                    top1_stable_count = 0
+                else:
+                    top1_stable_count += 1
+                
+                # 判断阶段并统计加速边
+                if top1_stable_count < top1_stable_threshold:
+                    # 第一阶段：top-1 持续变化
+                    if nb not in phase_1_steps:
+                        phase_1_steps.append(nb)
+                        if is_accel_edge:
+                            phase_1_accel_edges += 1
+                else:
+                    # 第二阶段：top-1 相对固定
+                    if nb not in phase_2_steps:
+                        phase_2_steps.append(nb)
+                        if is_accel_edge:
+                            phase_2_accel_edges += 1
+                
+            if found:
+                break
+        
+        # 分析结果
+        phase_analysis = {
+            "phase_1": {
+                "description": "快速靠近阶段 (top-1 持续变化)",
+                "steps": phase_1_steps,
+                "step_count": len(phase_1_steps),
+                "accel_edges": phase_1_accel_edges,
+                "accel_edge_ratio": phase_1_accel_edges / len(phase_1_steps) if phase_1_steps else 0,
+                "nodes": [self.items[nid].vector for nid in phase_1_steps]
+            },
+            "phase_2": {
+                "description": "Beam Search 阶段 (top-1 相对固定)",
+                "steps": phase_2_steps,
+                "step_count": len(phase_2_steps),
+                "accel_edges": phase_2_accel_edges,
+                "accel_edge_ratio": phase_2_accel_edges / len(phase_2_steps) if phase_2_steps else 0,
+                "nodes": [self.items[nid].vector for nid in phase_2_steps]
+            },
+            "total_steps": len(steps),
+            "total_accel_edges": phase_1_accel_edges + phase_2_accel_edges,
+            "phase_1_ratio": len(phase_1_steps) / len(steps) if steps else 0,
+            "phase_2_ratio": len(phase_2_steps) / len(steps) if steps else 0,
+            "overall_accel_edge_ratio": (phase_1_accel_edges + phase_2_accel_edges) / len(steps) if steps else 0
+        }
+        
+        if verbose:
+            print(f"\n=== 阶段分析结果 ===")
+            print(f"第一阶段 (快速靠近): {len(phase_1_steps)} 步, 占比: {phase_analysis['phase_1_ratio']:.2%}")
+            print(f"  经过加速边: {phase_1_accel_edges} 条, 加速边比例: {phase_analysis['phase_1']['accel_edge_ratio']:.2%}")
+            print(f"第二阶段 (Beam Search): {len(phase_2_steps)} 步, 占比: {phase_analysis['phase_2_ratio']:.2%}")
+            print(f"  经过加速边: {phase_2_accel_edges} 条, 加速边比例: {phase_analysis['phase_2']['accel_edge_ratio']:.2%}")
+            print(f"总步数: {len(steps)}, 总加速边: {phase_analysis['total_accel_edges']}, 整体加速边比例: {phase_analysis['overall_accel_edge_ratio']:.2%}")
+            
+            if phase_1_steps:
+                print(f"第一阶段节点: {phase_1_steps[:5]}{'...' if len(phase_1_steps) > 5 else ''}")
+            if phase_2_steps:
+                print(f"第二阶段节点: {phase_2_steps[:5]}{'...' if len(phase_2_steps) > 5 else ''}")
+        
+        return steps, found, phase_analysis
 
     # ====== RoarGraph 风格的 Cross Distribution 边构建 ======
     def build_cross_distribution_edges(
@@ -567,6 +742,7 @@ class HNSWIndex:
         use_metric: bool = True,
         chain_extra: int = 0,
         strict_exist_check: bool = True,
+        check_high_layer: bool = False,
     ) -> dict:
         """
         基于 RoarGraph 论文的方法构建 cross distribution 边
@@ -649,7 +825,7 @@ class HNSWIndex:
 
         for query_id, topk in query_topk.items():
             # 清洗：只保留在索引中的 id
-            ids = [nid for nid in topk[:10] if nid in self.items]
+            ids = [nid for nid in topk if nid in self.items]
             if len(ids) < len(topk):
                 stats["skipped_missing"] += (len(topk) - len(ids))
             if len(ids) <= 1:
