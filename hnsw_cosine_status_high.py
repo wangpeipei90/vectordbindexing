@@ -1169,3 +1169,86 @@ class HNSWIndex:
             "deleted_cross_edges": 0,
             "cross_edges_by_query": defaultdict(int)
         }
+
+    def query(self, vector: np.ndarray, k: int = 10, ef: Optional[int] = None, 
+              track_steps: bool = False) -> List[int]:
+        """
+        使用HNSW索引进行查询
+        
+        Parameters:
+        -----------
+        vector : np.ndarray
+            查询向量
+        k : int
+            返回top-k结果
+        ef : Optional[int]
+            搜索beam width，如果None使用self.ef_search
+        track_steps : bool
+            是否跟踪搜索步数
+            
+        Returns:
+        --------
+        List[int]
+            返回的节点ID列表
+        """
+        if not self.items:
+            return []
+        
+        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        eff = max(self.ef_search, k) if ef is None else max(ef, k)
+        
+        # 从最高层开始搜索
+        current_node = self.entry_point
+        for l in range(self.max_level, 0, -1):
+            current_node = self._search_layer_greedy(vec, current_node, l)
+        
+        # 在第0层进行beam search
+        candidates = self._search_layer(vec, current_node, 0, eff)
+        
+        # 计算距离并排序
+        dists = [(cid, self.distance(vec, self.items[cid].vector)) for cid in candidates]
+        dists.sort(key=lambda x: x[1])
+        
+        return [cid for cid, _ in dists[:k]]
+
+    def query_with_steps(self, vector: np.ndarray, k: int = 10, ef: Optional[int] = None) -> Tuple[List[int], int]:
+        """
+        使用HNSW索引进行查询并跟踪搜索步数
+        
+        Parameters:
+        -----------
+        vector : np.ndarray
+            查询向量
+        k : int
+            返回top-k结果
+        ef : Optional[int]
+            搜索beam width，如果None使用self.ef_search
+            
+        Returns:
+        --------
+        Tuple[List[int], int]
+            (返回的节点ID列表, 搜索步数)
+        """
+        if not self.items:
+            return [], 0
+        
+        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        eff = max(self.ef_search, k) if ef is None else max(ef, k)
+        
+        total_steps = 0
+        
+        # 从最高层开始搜索，跟踪步数
+        current_node = self.entry_point
+        for l in range(self.max_level, 0, -1):
+            current_node, steps, _ = self._search_layer_greedy_trace(vec, current_node, l)
+            total_steps += len(steps)
+        
+        # 在第0层进行beam search，跟踪步数
+        candidates = self._search_layer(vec, current_node, 0, eff)
+        total_steps += len(candidates)  # 近似步数
+        
+        # 计算距离并排序
+        dists = [(cid, self.distance(vec, self.items[cid].vector)) for cid in candidates]
+        dists.sort(key=lambda x: x[1])
+        
+        return [cid for cid, _ in dists[:k]], total_steps

@@ -10,9 +10,11 @@ from typing import Dict, List, Tuple, Iterable, Optional
 
 from simple_sim_hash import SimpleSimHash
 
+
 def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     # 先离线把向量做 unit-norm，再使用 1 - 内积（= 1 - cos）
     return float(1.0 - np.dot(a, b))
+
 
 def cosine_distance_batch(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
@@ -22,18 +24,20 @@ def cosine_distance_batch(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
     # 一次性计算所有 dot product
     a = a.reshape(1, 200)
-    b = b.reshape(-1,200)
+    b = b.reshape(-1, 200)
     dots = np.matmul(a, b.T)  # shape (n,)
-    
+
     # cosine distance = 1 - cos
     distances = 1.0 - dots
     return distances.flatten()
+
 
 def _unit_norm(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = float(np.linalg.norm(v))
     if n < eps:
         return v.astype(np.float32, copy=False)
     return (v / n).astype(np.float32, copy=False)
+
 
 @dataclass
 class Node:
@@ -84,9 +88,11 @@ class HNSWIndex:
         # map node id -> Node
         self.items: Dict[int, Node] = {}
         # adjacency lists per layer: layer -> id -> list of neighbour ids
-        self.neighbours: Dict[int, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
+        self.neighbours: Dict[int, Dict[int, List[int]]
+                              ] = defaultdict(lambda: defaultdict(list))
         # 新增：边的标记信息，用于跟踪 cross distribution 边
-        self.edge_flags: Dict[int, Dict[int, Dict[int, str]]] = defaultdict(lambda: defaultdict(dict))
+        self.edge_flags: Dict[int, Dict[int, Dict[int, str]]
+                              ] = defaultdict(lambda: defaultdict(dict))
         # 新增：统计信息
         self.cross_distribution_stats = {
             "total_cross_edges": 0,
@@ -109,8 +115,8 @@ class HNSWIndex:
         return level
 
     def select_candidate_ids(self, vec: np.ndarray, limit: int = 10000,
-                         lsh: Optional[SimpleSimHash] = None,
-                         upper_layer_budget: int = 5000) -> List[int]:
+                             lsh: Optional[SimpleSimHash] = None,
+                             upper_layer_budget: int = 5000) -> List[int]:
         cand = []
 
         # A) 上层引导：从最高层做有界扩展，逐层向下累积
@@ -121,7 +127,8 @@ class HNSWIndex:
             steps = 0
             while frontier and steps < upper_layer_budget // max(1, (self.max_level+1)):
                 nid = frontier.pop()
-                if nid in visited: continue
+                if nid in visited:
+                    continue
                 visited.add(nid)
                 cand.append(nid)
                 # 邻居推进
@@ -154,7 +161,7 @@ class HNSWIndex:
 
     # ==== 1) 只在白名单里搜索（greedy / single-layer） ====
     def _search_layer_greedy_allowed(self, vec: np.ndarray, entry_id: int, layer: int,
-                                 allowed: Optional[set] = None) -> int:
+                                     allowed: Optional[set] = None) -> int:
         current = entry_id
         best_dist = self.distance(vec, self.items[current].vector)
         improved = True
@@ -175,8 +182,9 @@ class HNSWIndex:
         return current
 
     def _search_layer_allowed(self, vec: np.ndarray, entry_id: int, layer: int, ef: int,
-                            allowed: Optional[set] = None) -> List[int]:
-        import heapq, math
+                              allowed: Optional[set] = None) -> List[int]:
+        import heapq
+        import math
         N = self._id_counter
         visited = np.zeros(N, dtype=bool)
         candidates: List[Tuple[float, int]] = []
@@ -219,10 +227,10 @@ class HNSWIndex:
                         worst_dist = -result[0][0]
         return [nid for (_, nid) in result]
 
-
     def add_item_fast10k(self, vector: np.ndarray, id: Optional[int] = None,
-                     lsh: Optional[SimpleSimHash] = None, limit: int = 10000) -> int:
-        vec = (vector / (np.linalg.norm(vector) + 1e-12)).astype(np.float32, copy=False)
+                         lsh: Optional[SimpleSimHash] = None, limit: int = 10000) -> int:
+        vec = (vector / (np.linalg.norm(vector) + 1e-12)
+               ).astype(np.float32, copy=False)
         if id is None:
             id = self._id_counter
             self._id_counter += 1
@@ -232,7 +240,8 @@ class HNSWIndex:
         if self.entry_point is None:
             self.entry_point = id
             self.max_level = level
-            if lsh is not None: lsh.add(id, vec)
+            if lsh is not None:
+                lsh.add(id, vec)
             return id
 
         if level > self.max_level:
@@ -245,11 +254,13 @@ class HNSWIndex:
         # 自顶向下：greedy 限于 allowed
         current_node = self.entry_point
         for l in range(self.max_level, level, -1):
-            current_node = self._search_layer_greedy_allowed(vec, current_node, l, allowed_ids)
+            current_node = self._search_layer_greedy_allowed(
+                vec, current_node, l, allowed_ids)
 
         # 底层及以下各层：单层 best-first + 选邻 接边，均限于 allowed
         for l in range(min(level, self.max_level), -1, -1):
-            candidates = self._search_layer_allowed(vec, current_node, l, self.ef_construction, allowed_ids)
+            candidates = self._search_layer_allowed(
+                vec, current_node, l, self.ef_construction, allowed_ids)
             neighbours = self._select_neighbors(vec, candidates, self.M)
             for nb in neighbours:
                 self._add_link(id, nb, l)
@@ -301,7 +312,8 @@ class HNSWIndex:
 
         # search and connect neighbours on layers <= level
         for l in range(min(level, self.max_level), -1, -1):
-            candidates = self._search_layer(vec, current_node, l, self.ef_construction)
+            candidates = self._search_layer(
+                vec, current_node, l, self.ef_construction)
             neighbours = self._select_neighbors(vec, candidates, self.M)
             for nb in neighbours:
                 self._add_link(id, nb, l)
@@ -328,8 +340,9 @@ class HNSWIndex:
                         # 从标记中移除
                         if deleted_nb in self.edge_flags[layer][source]:
                             del self.edge_flags[layer][source][deleted_nb]
-                
-                self.neighbours[layer][source] = [n for n, _ in distances[:self.M]]
+
+                self.neighbours[layer][source] = [
+                    n for n, _ in distances[:self.M]]
 
     def _add_cross_distribution_link(self, source: int, dest: int, layer: int, query_id: Optional[int] = None) -> None:
         """Add a cross distribution link with marking."""
@@ -341,7 +354,7 @@ class HNSWIndex:
             self.cross_distribution_stats["total_cross_edges"] += 1
             if query_id is not None:
                 self.cross_distribution_stats["cross_edges_by_query"][query_id] += 1
-            
+
             if len(nbrs) > self.M:
                 # 计算到 source 的距离并保留最近的 M 个
                 distances = [(n, self.distance(self.items[source].vector, self.items[n].vector))
@@ -355,8 +368,9 @@ class HNSWIndex:
                         # 从标记中移除
                         if deleted_nb in self.edge_flags[layer][source]:
                             del self.edge_flags[layer][source][deleted_nb]
-                
-                self.neighbours[layer][source] = [n for n, _ in distances[:self.M]]
+
+                self.neighbours[layer][source] = [
+                    n for n, _ in distances[:self.M]]
 
     def _add_QD_link(self, source: int, dest: int, layer: int, reset_: bool) -> None:
         """Add a directed link from ``source`` to ``dest`` on ``layer`` 不截断"""
@@ -366,7 +380,7 @@ class HNSWIndex:
         if reset_ and len(nbrs) > self.M:
             # 计算到 source 的距离并保留最近的 M 个
             distances = [(n, self.distance(self.items[source].vector, self.items[n].vector))
-                            for n in nbrs]
+                         for n in nbrs]
             distances.sort(key=lambda x: x[1])
             # 记录被删除的 cross distribution 边
             deleted_neighbors = [n for n, _ in distances[self.M:]]
@@ -376,7 +390,7 @@ class HNSWIndex:
                     # 从标记中移除
                     if deleted_nb in self.edge_flags[layer][source]:
                         del self.edge_flags[layer][source][deleted_nb]
-            
+
             self.neighbours[layer][source] = [n for n, _ in distances[:self.M]]
 
     def _dist(self, u: int, v: int) -> float:
@@ -400,7 +414,6 @@ class HNSWIndex:
         except Exception:
             # 兜底：使用通用的距离函数
             return float(self.distance(a, b))
-
 
     def _select_neighbors(self, vec: np.ndarray, candidates: Iterable[int], M: int) -> List[int]:
         """Pick the M closest candidate ids to vec (simple heuristic)."""
@@ -522,15 +535,16 @@ class HNSWIndex:
         for l in range(self.max_level, 0, -1):
             curr = self._search_layer_greedy(vec, curr, l)
         candidates = self._search_layer(vec, curr, 0, max(self.ef_search, k))
-        dists = [(cid, self.distance(vec, self.items[cid].vector)) for cid in candidates]
+        dists = [(cid, self.distance(vec, self.items[cid].vector))
+                 for cid in candidates]
         dists.sort(key=lambda x: x[1])
         return dists[:k]
 
     # ===== Public API: search with steps to reach a target =====
-    def search_steps_to_target(self, vector: np.ndarray, target_id: int, k: int = 10, ef: Optional[int] = None, 
-                              verbose: bool = False, analyze_phases: bool = False):
+    def search_steps_to_target(self, vector: np.ndarray, target_id: int, k: int = 10, ef: Optional[int] = None,
+                               verbose: bool = False, analyze_phases: bool = False):
         """Run a query and return the detailed navigation steps until the target is first reached.
-        
+
         Parameters:
         -----------
         vector : np.ndarray
@@ -545,7 +559,7 @@ class HNSWIndex:
             Whether to print detailed distance information
         analyze_phases : bool
             Whether to analyze and print phase information
-            
+
         Returns:
         --------
         dict with keys:
@@ -564,7 +578,7 @@ class HNSWIndex:
         # 1) run best-first with trace until target first appears/popped
         curr = self.entry_point
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
-        
+
         if analyze_phases:
             # 详细分析搜索阶段
             steps, found, phase_info = self._search_layer_trace_until_target_with_phases(
@@ -573,53 +587,55 @@ class HNSWIndex:
             trace.extend(steps)
             phase_analysis = phase_info
         else:
-            steps, found = self._search_layer_trace_until_target(vec, curr, 0, eff, target_id)
+            steps, found = self._search_layer_trace_until_target(
+                vec, curr, 0, eff, target_id)
             trace.extend(steps)
 
         # 3) Optionally finish a normal search to return a final top-k list
         # （这部分不影响"找到 target 的时刻"，仅用于返回参考的 top-k）
         cands = self._search_layer(vec, curr, 0, eff)
-        dists = [(cid, self.distance(vec, self.items[cid].vector)) for cid in cands]
+        dists = [(cid, self.distance(vec, self.items[cid].vector))
+                 for cid in cands]
         dists.sort(key=lambda x: x[1])
         topk = dists[:k]
 
         result = {"found": found, "trace": trace, "final_candidates": topk}
         if analyze_phases:
             result["phase_analysis"] = phase_analysis
-            
+
         return result
 
     # ===== 新增：带阶段分析的搜索函数 =====
-    def _search_layer_trace_until_target_with_phases(self, vec: np.ndarray, entry_id: int, layer: int, 
-                                                   ef: int, target_id: int, verbose: bool = False):
+    def _search_layer_trace_until_target_with_phases(self, vec: np.ndarray, entry_id: int, layer: int,
+                                                     ef: int, target_id: int, verbose: bool = False):
         """
         带阶段分析的搜索函数，区分快速靠近阶段和 beam search 阶段
         并统计每个阶段经过的 cross distribution 加速边
         """
         import heapq
-        
+
         steps = []
         visited: set[int] = set()
         candidates: List[Tuple[float, int]] = []   # min-heap by dist
         result: List[Tuple[float, int]] = []       # max-heap via negative dist
-        
+
         # 阶段分析相关变量
         phase_1_steps = []  # 第一阶段：top-1 持续变化
         phase_2_steps = []  # 第二阶段：top-1 相对固定
         current_top1 = entry_id
         top1_stable_count = 0
         top1_stable_threshold = 3  # top-1 连续保持不变的次数阈值
-        
+
         # 加速边统计
         phase_1_accel_edges = 0  # 第一阶段经过的加速边数
         phase_2_accel_edges = 0  # 第二阶段经过的加速边数
-        
+
         dist_entry = self.distance(vec, self.items[entry_id].vector)
         heapq.heappush(candidates, (dist_entry, entry_id))
         heapq.heappush(result, (-dist_entry, entry_id))
         visited.add(entry_id)
         steps.append(entry_id)
-        
+
         if verbose:
             print(f"起始点: {entry_id}, 距离: {dist_entry:.6f}")
 
@@ -637,44 +653,46 @@ class HNSWIndex:
                 visited.add(nb)
                 d = self.distance(vec, self.items[nb].vector)
                 steps.append(nb)
-                
+
                 # 检查是否经过 cross distribution 加速边
                 is_accel_edge = False
                 if layer in self.edge_flags and curr in self.edge_flags[layer]:
                     if nb in self.edge_flags[layer][curr] and self.edge_flags[layer][curr][nb] == "cross_distribution":
                         is_accel_edge = True
-                
+
                 if verbose:
                     edge_type = "加速边" if is_accel_edge else "普通边"
-                    print(f"访问节点: {nb}, 距离: {d:.6f}, 当前最佳: {dist_curr:.6f}, 边类型: {edge_type}")
-                
+                    print(
+                        f"访问节点: {nb}, 距离: {d:.6f}, 当前最佳: {dist_curr:.6f}, 边类型: {edge_type}")
+
                 if len(result) < ef or d < worst_dist:
                     heapq.heappush(candidates, (d, nb))
                     heapq.heappush(result, (-d, nb))
                     if len(result) > ef:
                         popped = heapq.heappop(result)
                         worst_dist = -result[0][0]
-                
+
                 # 检查是否找到目标
                 if nb == target_id:
                     found = True
                     if verbose:
                         print(f"找到目标节点: {target_id}, 距离: {d:.6f}")
                     break
-                    
+
                 # 阶段分析：检查 top-1 是否发生变化
                 if result and result[0][1] != current_top1:
                     # top-1 发生变化
                     new_top1 = result[0][1]
                     new_top1_dist = -result[0][0]
                     if verbose:
-                        print(f"Top-1 变化: {current_top1} -> {new_top1}, 距离: {new_top1_dist:.6f}")
-                    
+                        print(
+                            f"Top-1 变化: {current_top1} -> {new_top1}, 距离: {new_top1_dist:.6f}")
+
                     current_top1 = new_top1
                     top1_stable_count = 0
                 else:
                     top1_stable_count += 1
-                
+
                 # 判断阶段并统计加速边
                 if top1_stable_count < top1_stable_threshold:
                     # 第一阶段：top-1 持续变化
@@ -688,10 +706,10 @@ class HNSWIndex:
                         phase_2_steps.append(nb)
                         if is_accel_edge:
                             phase_2_accel_edges += 1
-                
+
             if found:
                 break
-        
+
         # 分析结果
         phase_analysis = {
             "phase_1": {
@@ -716,26 +734,33 @@ class HNSWIndex:
             "phase_2_ratio": len(phase_2_steps) / len(steps) if steps else 0,
             "overall_accel_edge_ratio": (phase_1_accel_edges + phase_2_accel_edges) / len(steps) if steps else 0
         }
-        
+
         if verbose:
             print(f"\n=== 阶段分析结果 ===")
-            print(f"第一阶段 (快速靠近): {len(phase_1_steps)} 步, 占比: {phase_analysis['phase_1_ratio']:.2%}")
-            print(f"  经过加速边: {phase_1_accel_edges} 条, 加速边比例: {phase_analysis['phase_1']['accel_edge_ratio']:.2%}")
-            print(f"第二阶段 (Beam Search): {len(phase_2_steps)} 步, 占比: {phase_analysis['phase_2_ratio']:.2%}")
-            print(f"  经过加速边: {phase_2_accel_edges} 条, 加速边比例: {phase_analysis['phase_2']['accel_edge_ratio']:.2%}")
-            print(f"总步数: {len(steps)}, 总加速边: {phase_analysis['total_accel_edges']}, 整体加速边比例: {phase_analysis['overall_accel_edge_ratio']:.2%}")
-            
+            print(
+                f"第一阶段 (快速靠近): {len(phase_1_steps)} 步, 占比: {phase_analysis['phase_1_ratio']:.2%}")
+            print(
+                f"  经过加速边: {phase_1_accel_edges} 条, 加速边比例: {phase_analysis['phase_1']['accel_edge_ratio']:.2%}")
+            print(
+                f"第二阶段 (Beam Search): {len(phase_2_steps)} 步, 占比: {phase_analysis['phase_2_ratio']:.2%}")
+            print(
+                f"  经过加速边: {phase_2_accel_edges} 条, 加速边比例: {phase_analysis['phase_2']['accel_edge_ratio']:.2%}")
+            print(
+                f"总步数: {len(steps)}, 总加速边: {phase_analysis['total_accel_edges']}, 整体加速边比例: {phase_analysis['overall_accel_edge_ratio']:.2%}")
+
             if phase_1_steps:
-                print(f"第一阶段节点: {phase_1_steps[:5]}{'...' if len(phase_1_steps) > 5 else ''}")
+                print(
+                    f"第一阶段节点: {phase_1_steps[:5]}{'...' if len(phase_1_steps) > 5 else ''}")
             if phase_2_steps:
-                print(f"第二阶段节点: {phase_2_steps[:5]}{'...' if len(phase_2_steps) > 5 else ''}")
-        
+                print(
+                    f"第二阶段节点: {phase_2_steps[:5]}{'...' if len(phase_2_steps) > 5 else ''}")
+
         return steps, found, phase_analysis
 
     # ====== RoarGraph 风格的 Cross Distribution 边构建 ======
     def build_cross_distribution_edges(
         self,
-        query_topk: Dict[int, list[int]],
+        query_topk: Dict[int, list[int]] = None,
         layer: int = 0,
         max_new_edges_per_node: int = 4,
         occlude_alpha: float = 1.0,
@@ -743,14 +768,43 @@ class HNSWIndex:
         chain_extra: int = 0,
         strict_exist_check: bool = True,
         check_high_layer: bool = False,
+        query: np.ndarray = None,
+        top_k: int = 10,
+        random_seed: int = None,
     ) -> dict:
         """
         基于 RoarGraph 论文的方法构建 cross distribution 边
         只在第0层构建，使用投影策略来避免边的冗余
         """
-        if layer != 0:
-            return {"error": "Cross distribution edges only supported on layer 0"}
-        
+        # 处理新的query参数格式
+        if query is not None:
+            # 使用query参数的新格式，模拟query_topk
+            import random
+            if random_seed is not None:
+                random.seed(random_seed)
+
+            # 从最高层开始搜索到layer 1
+            current_node = self.entry_point
+            for l in range(self.max_level, 1, -1):
+                current_node = self._search_layer_greedy(
+                    query, current_node, l)
+
+            # 在layer 1中进行beam search获取top_k节点
+            candidates = self._search_layer(query, current_node, 1, top_k)
+
+            # 过滤掉不在layer 1的节点
+            layer1_candidates = [
+                nid for nid in candidates if nid in self.items and self.items[nid].level >= 1]
+
+            # 构建query_topk格式
+            query_topk = {0: layer1_candidates}  # 使用0作为query_id
+            layer = 1  # 在layer 1构建边
+        elif query_topk is None:
+            return {"error": "Either query or query_topk must be provided"}
+
+        if layer != 0 and layer != 1:
+            return {"error": "Cross distribution edges only supported on layer 0 or 1"}
+
         if layer < 0 or layer > self.max_level:
             return {"error": "Invalid layer"}
 
@@ -772,7 +826,7 @@ class HNSWIndex:
 
         def can_add(u: int, v: int):
             # 度预算
-            if (max_new_edges_per_node is not None) and ( (added_per_node[u] >= max_new_edges_per_node) or (added_per_node[v] >= max_new_edges_per_node) ):
+            if (max_new_edges_per_node is not None) and ((added_per_node[u] >= max_new_edges_per_node) or (added_per_node[v] >= max_new_edges_per_node)):
                 stats["pruned_by_cap"] += 1
                 return False
             # 检查是否已存在边
@@ -886,9 +940,11 @@ class HNSWIndex:
             return {"pairs_considered": 0, "pairs_added": 0, "skipped_missing": 0, "skipped_existing": 0, "pruned_by_cap": 0, "skipped_occluded": 0}
 
         # 读取可选开关（不破坏签名）
-        occlude_alpha: float = float(getattr(self, "qd_occlude_alpha", 1.0))   # >=1.0
+        occlude_alpha: float = float(
+            getattr(self, "qd_occlude_alpha", 1.0))   # >=1.0
         use_metric: bool = bool(getattr(self, "qd_use_metric", True))
-        chain_extra: int = int(getattr(self, "qd_chain", 0))  # 每个查询对已选邻居额外链几条边（小数值即可）
+        # 每个查询对已选邻居额外链几条边（小数值即可）
+        chain_extra: int = int(getattr(self, "qd_chain", 0))
 
         # 每个节点本次新增计数（限流）
         from collections import defaultdict
@@ -908,7 +964,7 @@ class HNSWIndex:
 
         def can_add(u: int, v: int):
             # 度预算
-            if (max_new_edges_per_node is not None) and ( (added_per_node[u] >= max_new_edges_per_node) or (added_per_node[v] >= max_new_edges_per_node) ):
+            if (max_new_edges_per_node is not None) and ((added_per_node[u] >= max_new_edges_per_node) or (added_per_node[v] >= max_new_edges_per_node)):
                 stats["pruned_by_cap"] += 1
                 return False, 0
             for layer_id in range(0, self.max_level):
@@ -923,7 +979,7 @@ class HNSWIndex:
                 degree_queue = queue.Queue()
                 sub_degree_queue = queue.Queue()
                 explore_depth = 3
-                degree_queue.put({"layer":layer_id, "id": u})
+                degree_queue.put({"layer": layer_id, "id": u})
                 while degree_queue.empty() and sub_degree_queue.empty():
                     if explore_depth % 2 == 1:
                         m = degree_queue.get()
@@ -934,7 +990,8 @@ class HNSWIndex:
                                 if v in self.neighbours[ano_layer][x]:
                                     can_add = False
                                     break
-                                sub_degree_queue.put({"layer":ano_layer, "id": x})
+                                sub_degree_queue.put(
+                                    {"layer": ano_layer, "id": x})
                     else:
                         m = sub_degree_queue.get()
                         for x in self.neighbours[m["layer"]][m["id"]]:
@@ -945,7 +1002,8 @@ class HNSWIndex:
                                     can_add = False
                                     break
                                 if explore_depth > 0:
-                                    degree_queue.put({"layer":ano_layer, "id": x})
+                                    degree_queue.put(
+                                        {"layer": ano_layer, "id": x})
                     if not can_add:
                         break
                     if degree_queue.empty() or sub_degree_queue.empty():
@@ -1071,3 +1129,89 @@ class HNSWIndex:
             "deleted_cross_edges": 0,
             "cross_edges_by_query": defaultdict(int)
         }
+
+    def query(self, vector: np.ndarray, k: int = 10, ef: Optional[int] = None,
+              track_steps: bool = False) -> List[int]:
+        """
+        使用HNSW索引进行查询
+
+        Parameters:
+        -----------
+        vector : np.ndarray
+            查询向量
+        k : int
+            返回top-k结果
+        ef : Optional[int]
+            搜索beam width，如果None使用self.ef_search
+        track_steps : bool
+            是否跟踪搜索步数
+
+        Returns:
+        --------
+        List[int]
+            返回的节点ID列表
+        """
+        if not self.items:
+            return []
+
+        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        eff = max(self.ef_search, k) if ef is None else max(ef, k)
+
+        # 从最高层开始搜索
+        current_node = self.entry_point
+        for l in range(self.max_level, 0, -1):
+            current_node = self._search_layer_greedy(vec, current_node, l)
+
+        # 在第0层进行beam search
+        candidates = self._search_layer(vec, current_node, 0, eff)
+
+        # 计算距离并排序
+        dists = [(cid, self.distance(vec, self.items[cid].vector))
+                 for cid in candidates]
+        dists.sort(key=lambda x: x[1])
+
+        return [cid for cid, _ in dists[:k]]
+
+    def query_with_steps(self, vector: np.ndarray, k: int = 10, ef: Optional[int] = None) -> Tuple[List[int], int]:
+        """
+        使用HNSW索引进行查询并跟踪搜索步数
+
+        Parameters:
+        -----------
+        vector : np.ndarray
+            查询向量
+        k : int
+            返回top-k结果
+        ef : Optional[int]
+            搜索beam width，如果None使用self.ef_search
+
+        Returns:
+        --------
+        Tuple[List[int], int]
+            (返回的节点ID列表, 搜索步数)
+        """
+        if not self.items:
+            return [], 0
+
+        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        eff = max(self.ef_search, k) if ef is None else max(ef, k)
+
+        total_steps = 0
+
+        # 从最高层开始搜索，跟踪步数
+        current_node = self.entry_point
+        for l in range(self.max_level, 0, -1):
+            current_node, steps = self._search_layer_greedy_trace(
+                vec, current_node, l)
+            total_steps += len(steps)
+
+        # 在第0层进行beam search，跟踪步数
+        candidates = self._search_layer(vec, current_node, 0, eff)
+        total_steps += len(candidates)  # 近似步数
+
+        # 计算距离并排序
+        dists = [(cid, self.distance(vec, self.items[cid].vector))
+                 for cid in candidates]
+        dists.sort(key=lambda x: x[1])
+
+        return [cid for cid, _ in dists[:k]], total_steps
