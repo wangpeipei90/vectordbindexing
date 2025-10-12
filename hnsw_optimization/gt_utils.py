@@ -5,7 +5,8 @@ Ground truth utilities for HNSW optimization experiments
 
 import numpy as np
 import faiss
-from typing import Tuple, List, Optional
+import json
+from typing import Tuple, List, Optional, Dict
 import logging
 from tqdm import tqdm
 import time
@@ -26,6 +27,53 @@ class GroundTruthComputer:
         self.metric = metric
         self.gt_neighbors: Optional[np.ndarray] = None
         self.gt_distances: Optional[np.ndarray] = None
+
+    def load_ground_truth_from_json(self,
+                                    json_path: str,
+                                    n_queries: Optional[int] = None,
+                                    k: Optional[int] = None) -> np.ndarray:
+        """
+        Load ground truth neighbors from JSON file (e.g., faiss_top100_results.json)
+
+        Args:
+            json_path: Path to JSON file containing ground truth results
+            n_queries: Number of queries to load (None for all)
+            k: Number of neighbors per query (None for all available)
+
+        Returns:
+            Ground truth neighbors array of shape (Q x k)
+        """
+        logger.info(f"Loading ground truth from {json_path}")
+
+        with open(json_path, 'r') as f:
+            gt_dict = json.load(f)
+
+        # Convert JSON dict to numpy array
+        # JSON keys are query IDs (as strings), values are lists of neighbor IDs
+        query_ids = sorted([int(qid) for qid in gt_dict.keys()])
+
+        if n_queries is not None:
+            query_ids = query_ids[:n_queries]
+
+        # Determine k (number of neighbors)
+        first_neighbors = gt_dict[str(query_ids[0])]
+        max_k = len(first_neighbors)
+        if k is None:
+            k = max_k
+        else:
+            k = min(k, max_k)
+
+        # Build neighbors array
+        neighbors_list = []
+        for qid in query_ids:
+            neighbors = gt_dict[str(qid)][:k]
+            neighbors_list.append(neighbors)
+
+        self.gt_neighbors = np.array(neighbors_list, dtype=np.int32)
+        logger.info(
+            f"Loaded ground truth: {self.gt_neighbors.shape[0]} queries, k={self.gt_neighbors.shape[1]}")
+
+        return self.gt_neighbors
 
     def compute_ground_truth(self,
                              X: np.ndarray,

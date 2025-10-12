@@ -20,19 +20,11 @@ __author__ = "HNSW Optimization Team"
 # Import main classes for easy access
 from .data_loader import DataLoader, create_toy_dataset
 from .gt_utils import GroundTruthComputer
-from .hnsw_baseline import HNSWBaseline, FAISSBaseline
-from .bridge_builder import BridgeBuilder
-from .multi_entry_search import MultiEntrySearch, AdaptiveMultiEntrySearch
-from .experiment_runner import ExperimentRunner
+from .hnsw_with_bridges import HNSWWithBridges
 
 __all__ = [
     'DataLoader',
     'create_toy_dataset',
     'GroundTruthComputer',
-    'HNSWBaseline',
-    'FAISSBaseline',
-    'BridgeBuilder',
-    'MultiEntrySearch',
-    'AdaptiveMultiEntrySearch',
-    'ExperimentRunner'
+    'HNSWWithBridges',  # 新增：集成版 HNSW
 ]

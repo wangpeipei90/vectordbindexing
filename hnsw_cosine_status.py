@@ -11,32 +11,24 @@ from typing import Dict, List, Tuple, Iterable, Optional
 from simple_sim_hash import SimpleSimHash
 
 
-def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    # 先离线把向量做 unit-norm，再使用 1 - 内积（= 1 - cos）
-    return float(1.0 - np.dot(a, b))
+def l2_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """计算L2距离（欧氏距离）"""
+    diff = a - b
+    return float(np.sqrt(np.dot(diff, diff)))
 
 
-def cosine_distance_batch(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def l2_distance_batch(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
-    vec: shape (d,)
-    arr: shape (n, d)
-    要求 vec 和 arr 已经预先 unit-norm 归一化
+    批量计算L2距离
+    a: shape (d,) - 单个向量
+    b: shape (n, d) - 多个向量
+    返回: shape (n,) - 距离数组
     """
-    # 一次性计算所有 dot product
-    a = a.reshape(1, 200)
-    b = b.reshape(-1, 200)
-    dots = np.matmul(a, b.T)  # shape (n,)
-
-    # cosine distance = 1 - cos
-    distances = 1.0 - dots
-    return distances.flatten()
-
-
-def _unit_norm(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n < eps:
-        return v.astype(np.float32, copy=False)
-    return (v / n).astype(np.float32, copy=False)
+    # 广播计算差值
+    diff = b - a.reshape(1, -1)  # shape (n, d)
+    # 计算L2距离
+    distances = np.sqrt(np.sum(diff * diff, axis=1))
+    return distances
 
 
 @dataclass
@@ -56,7 +48,7 @@ class Node:
 
 
 class HNSWIndex:
-    """Hierarchical Navigable Small World index using cosine distance.
+    """Hierarchical Navigable Small World index using L2 distance.
 
     Parameters
     ----------
@@ -69,7 +61,7 @@ class HNSWIndex:
     random_seed : Optional[int], optional
         Random seed for reproducibility.
     distance_fn : callable, optional
-        Distance function; default is cosine_distance.
+        Distance function; default is l2_distance.
     """
 
     def __init__(
@@ -78,7 +70,7 @@ class HNSWIndex:
         ef_construction: int = 200,
         ef_search: int = 50,
         random_seed: Optional[int] = None,
-        distance_fn=cosine_distance,
+        distance_fn=l2_distance,
     ) -> None:
         self.M = M
         self.ef_construction = max(ef_construction, M)
@@ -149,7 +141,7 @@ class HNSWIndex:
                 pool = list(set(lsh_ids).difference(cand))
                 if pool:
                     item_pool = [self.items[idx].vector for idx in pool]
-                    d = cosine_distance_batch(vec, np.array(item_pool))
+                    d = l2_distance_batch(vec, np.array(item_pool))
                     take = min(limit - len(cand), len(pool))
                     idx = np.argpartition(d, take-1)[:take]
                     cand.extend([pool[i] for i in idx.tolist()])
@@ -173,7 +165,7 @@ class HNSWIndex:
             if not nbs:
                 break
             item_nbs = [self.items[idx].vector for idx in nbs]
-            dists = cosine_distance_batch(vec, np.array(item_nbs))
+            dists = l2_distance_batch(vec, np.array(item_nbs))
             j = int(np.argmin(dists))
             if dists[j] < best_dist:
                 best_dist = float(dists[j])
@@ -210,7 +202,7 @@ class HNSWIndex:
                 continue
 
             item_nbs = [self.items[idx].vector for idx in nbs]
-            dvec = cosine_distance_batch(vec, np.array(item_nbs))
+            dvec = l2_distance_batch(vec, np.array(item_nbs))
             if len(dvec) > ef:
                 idx = np.argpartition(dvec, ef-1)[:ef]
                 nbs = [nbs[i] for i in idx.tolist()]
@@ -229,11 +221,14 @@ class HNSWIndex:
 
     def add_item_fast10k(self, vector: np.ndarray, id: Optional[int] = None,
                          lsh: Optional[SimpleSimHash] = None, limit: int = 10000) -> int:
-        vec = (vector / (np.linalg.norm(vector) + 1e-12)
-               ).astype(np.float32, copy=False)
+        # L2距离不需要归一化，直接使用原始向量
+        vec = np.asarray(vector, dtype=np.float32)
         if id is None:
             id = self._id_counter
             self._id_counter += 1
+        else:
+            # 当传入显式ID时，确保_id_counter足够大
+            self._id_counter = max(self._id_counter, id + 1)
         level = self._assign_level()
         self.items[id] = Node(vector=vec, level=level)
 
@@ -286,7 +281,7 @@ class HNSWIndex:
         int
             The id assigned to the inserted item.
         """
-        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        vec = np.asarray(vector, dtype=np.float32)
         # assign id and level
         if id is None:
             id = self._id_counter
@@ -527,10 +522,10 @@ class HNSWIndex:
         return steps, found
 
     def query(self, vector: np.ndarray, k: int) -> List[Tuple[int, float]]:
-        """Return the k nearest neighbours to vector (id, distance)."""
+        """Return the k nearest neighbours to vector (id, distance).        """
         if not self.items:
             return []
-        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        vec = np.asarray(vector, dtype=np.float32)
         curr = self.entry_point
         for l in range(self.max_level, 0, -1):
             curr = self._search_layer_greedy(vec, curr, l)
@@ -571,7 +566,7 @@ class HNSWIndex:
         if not self.items:
             return {"found": False, "trace": [], "final_candidates": []}
 
-        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        vec = np.asarray(vector, dtype=np.float32)
         trace = []
         phase_analysis = {}
 
@@ -1154,7 +1149,7 @@ class HNSWIndex:
         if not self.items:
             return []
 
-        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        vec = np.asarray(vector, dtype=np.float32)
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
 
         # 从最高层开始搜索
@@ -1193,7 +1188,7 @@ class HNSWIndex:
         if not self.items:
             return [], 0
 
-        vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+        vec = np.asarray(vector, dtype=np.float32)
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
 
         total_steps = 0

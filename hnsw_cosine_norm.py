@@ -29,32 +29,24 @@ from typing import Dict, List, Tuple, Iterable, Optional, Union
 from simple_sim_hash import SimpleSimHash
 
 
-def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
-    # 先离线把向量做 unit-norm，再使用 1 - 内积（= 1 - cos）
-    return float(1.0 - np.dot(a, b))
+def l2_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """计算L2距离（欧氏距离）"""
+    diff = a - b
+    return float(np.sqrt(np.dot(diff, diff)))
 
 
-def cosine_distance_batch(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def l2_distance_batch(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """
-    vec: shape (d,)
-    arr: shape (n, d)
-    要求 vec 和 arr 已经预先 unit-norm 归一化
+    批量计算L2距离
+    a: shape (d,) - 单个向量
+    b: shape (n, d) - 多个向量
+    返回: shape (n,) - 距离数组
     """
-    # 一次性计算所有 dot product
-    a = a.reshape(1, -1)
-    b = b.reshape(-1, a.shape[1])
-    dots = np.matmul(a, b.T)  # shape (n,)
-
-    # cosine distance = 1 - cos
-    distances = 1.0 - dots
-    return distances.flatten()
-
-
-def _unit_norm(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n < eps:
-        return v.astype(np.float32, copy=False)
-    return (v / n).astype(np.float32, copy=False)
+    # 广播计算差值
+    diff = b - a.reshape(1, -1)  # shape (n, d)
+    # 计算L2距离
+    distances = np.sqrt(np.sum(diff * diff, axis=1))
+    return distances
 
 
 @dataclass
@@ -305,10 +297,8 @@ class DataPreprocessor:
                 else:
                     whitened_data *= self.image_scaling_factor
 
-            # Final L2 normalization
-            norms = np.linalg.norm(whitened_data, axis=1, keepdims=True)
-            norms = np.maximum(norms, 1e-12)
-            return (whitened_data / norms).astype(np.float32)
+            # 不进行L2归一化，直接返回whitened数据用于L2距离计算
+            return whitened_data.astype(np.float32)
 
         else:
             # Sub-modality whitening approach
@@ -323,10 +313,8 @@ class DataPreprocessor:
             centered_data = data - mean
             whitened_data = centered_data @ whitening_matrix.T
 
-            # Final L2 normalization
-            norms = np.linalg.norm(whitened_data, axis=1, keepdims=True)
-            norms = np.maximum(norms, 1e-12)
-            return (whitened_data / norms).astype(np.float32)
+            # 不进行L2归一化，直接返回whitened数据用于L2距离计算
+            return whitened_data.astype(np.float32)
 
     def transform_single(self, vector: np.ndarray, modality: str) -> np.ndarray:
         """
@@ -356,7 +344,7 @@ class HNSWIndex:
         ef_construction: int = 200,
         ef_search: int = 50,
         random_seed: Optional[int] = None,
-        distance_fn=cosine_distance,
+        distance_fn=l2_distance,
         preprocessor: Optional[DataPreprocessor] = None,
         max_search_nodes: int = 128,  # 新增：最大搜索节点数限制
     ) -> None:
@@ -421,14 +409,14 @@ class HNSWIndex:
         """
         # Apply preprocessing only if not already preprocessed
         if preprocessed:
-            # Vector is already preprocessed, just ensure it's unit normalized
-            vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+            # Vector is already preprocessed, use it directly
+            vec = np.asarray(vector, dtype=np.float32)
         elif self.preprocessor is not None and self.preprocessor.is_fitted:
             # Apply preprocessing if available
             vec = self.preprocessor.transform_single(vector, modality)
         else:
-            # No preprocessing, just normalize
-            vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+            # No preprocessing, use vector directly
+            vec = np.asarray(vector, dtype=np.float32)
 
         # assign id and level
         if id is None:
@@ -527,7 +515,8 @@ class HNSWIndex:
         # Preprocess all vectors at once if needed
         if preprocessed:
             # Vectors are already preprocessed, just ensure unit normalization
-            processed_vectors = np.array([_unit_norm(v) for v in vectors])
+            processed_vectors = np.array(
+                [np.asarray(v, dtype=np.float32) for v in vectors])
         elif self.preprocessor is not None and self.preprocessor.is_fitted:
             # Batch preprocessing for efficiency
             processed_vectors = []
@@ -538,7 +527,8 @@ class HNSWIndex:
             processed_vectors = np.array(processed_vectors)
         else:
             # No preprocessing, just normalize
-            processed_vectors = np.array([_unit_norm(v) for v in vectors])
+            processed_vectors = np.array(
+                [np.asarray(v, dtype=np.float32) for v in vectors])
 
         # Process in batches to avoid memory issues and improve performance
         added_ids = []
@@ -739,7 +729,7 @@ class HNSWIndex:
         if self.preprocessor is not None and self.preprocessor.is_fitted:
             vec = self.preprocessor.transform_single(vector, modality)
         else:
-            vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+            vec = np.asarray(vector, dtype=np.float32)
 
         curr = self.entry_point
         for l in range(self.max_level, 0, -1):
@@ -772,7 +762,7 @@ class HNSWIndex:
         if self.preprocessor is not None and self.preprocessor.is_fitted:
             query_vec = self.preprocessor.transform_single(query, "query")
         else:
-            query_vec = _unit_norm(np.asarray(query, dtype=np.float32))
+            query_vec = np.asarray(query, dtype=np.float32)
 
         from collections import defaultdict
         added_per_node: Dict[int, int] = defaultdict(int)
@@ -911,7 +901,7 @@ class HNSWIndex:
         if self.preprocessor is not None and self.preprocessor.is_fitted:
             vec = self.preprocessor.transform_single(vector, "query")
         else:
-            vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+            vec = np.asarray(vector, dtype=np.float32)
 
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
 
@@ -955,7 +945,7 @@ class HNSWIndex:
         if self.preprocessor is not None and self.preprocessor.is_fitted:
             vec = self.preprocessor.transform_single(vector, "query")
         else:
-            vec = _unit_norm(np.asarray(vector, dtype=np.float32))
+            vec = np.asarray(vector, dtype=np.float32)
 
         eff = max(self.ef_search, k) if ef is None else max(ef, k)
 
