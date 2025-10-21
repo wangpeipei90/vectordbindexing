@@ -8,10 +8,9 @@ This package implements two key optimizations for Hierarchical Navigable Small W
 Main components:
 - data_loader: Dataset loading and generation utilities
 - gt_utils: Ground truth computation and evaluation
-- hnsw_baseline: Baseline HNSW and FAISS implementations
+- hnsw_with_bridges_optimized: Optimized HNSW with integrated bridges (recommended)
 - bridge_builder: Bridge edge construction and management
 - multi_entry_search: Multi-entry search implementation
-- experiment_runner: Complete evaluation pipeline
 """
 
 __version__ = "1.0.0"
@@ -20,11 +19,11 @@ __author__ = "HNSW Optimization Team"
 # Import main classes for easy access
 from .data_loader import DataLoader, create_toy_dataset
 from .gt_utils import GroundTruthComputer
-from .hnsw_with_bridges import HNSWWithBridges
+from .hnsw_with_bridges_optimized import HNSWWithBridgesOptimized
 
 __all__ = [
     'DataLoader',
     'create_toy_dataset',
     'GroundTruthComputer',
-    'HNSWWithBridges',  # 新增：集成版 HNSW
+    'HNSWWithBridgesOptimized',  # 优化版（使用聚类，推荐）
 ]
