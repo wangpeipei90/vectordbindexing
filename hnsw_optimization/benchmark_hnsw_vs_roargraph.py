@@ -75,7 +75,11 @@ print(f"   桥接边数: {stats['total_bridges']}")
 
 # ==================== 3. 构建 RoarGraph 索引 ====================
 print("\n3. 构建 RoarGraph 索引...")
-# 关键修复：使用L2距离与HNSW保持一致
+print("   关键修复：")
+print("   1. 使用L2距离与HNSW保持一致")
+print("   2. 修复投影图构建逻辑（避免覆盖）")
+print("   3. 增加多入口点搜索和贪婪算法")
+
 roargraph = RoarGraph(dimension=X.shape[1], metric="l2")
 
 start_time = time.time()
@@ -91,6 +95,13 @@ roargraph_build_time = time.time() - start_time
 print(f"   ✓ RoarGraph 构建完成: {roargraph_build_time:.2f}s")
 print(f"   Base数据: {roargraph.n_base}")
 print(f"   Query数据: {roargraph.n_query}")
+
+# 打印投影图统计信息
+stats = roargraph.get_statistics()
+print(f"   投影图统计:")
+print(f"     - 平均度数: {stats['avg_projection_degree']:.2f}")
+print(f"     - 最大度数: {stats['max_projection_degree']}")
+print(f"     - 总边数: {stats['total_projection_edges']}")
 
 # ==================== 4. 性能测试 ====================
 print("\n4. 性能测试...")
@@ -176,17 +187,123 @@ for num_entries in entry_point_values:
 print(f"{'RoarGraph':<25} {roargraph_recall_10:<12.4f} {roargraph_recall_100:<12.4f} "
       f"{roargraph_avg_time:<15.3f} ±{roargraph_std_time:<10.3f}")
 
-# ==================== 6. 生成对比图表 ====================
-print("\n5. 生成对比图表...")
+# ==================== 6. 生成Latency vs Recall对比图 ====================
+print("\n5. 生成Latency vs Recall对比图（使用实际测量的latency）...")
+print("   测试不同ef_search值以获得不同latency范围的数据...")
 
-x_values = entry_point_values
-hnsw_recall_10 = [hnsw_results[n]['recall_10'] for n in entry_point_values]
-hnsw_recall_100 = [hnsw_results[n]['recall_100'] for n in entry_point_values]
-hnsw_latency = [hnsw_results[n]['avg_time_ms'] for n in entry_point_values]
+# ef_search值用于控制搜索质量和延迟
+ef_search_values = [50, 100, 150, 200, 250, 300, 350, 400]
+
+# 收集详细数据
+detailed_results = {}
+n_detail_queries = 50
+
+for num_entries in entry_point_values:
+    detailed_results[num_entries] = {}
+    print(f"   测试 {num_entries} 入口点...")
+
+    for ef_search in ef_search_values:
+        all_neighbors = []
+        search_times = []
+
+        for j in range(n_detail_queries):
+            start = time.time()
+            neighbors, _ = hnsw.search(
+                Q[j], k=100, ef_search=ef_search, num_entry_points=num_entries
+            )
+            search_times.append(time.time() - start)
+
+            # 确保返回固定长度的数组
+            if isinstance(neighbors, (list, np.ndarray)):
+                neighbors = np.array(neighbors)
+                # 如果长度不足100，填充-1
+                if len(neighbors) < 100:
+                    padded = np.full(100, -1, dtype=neighbors.dtype)
+                    padded[:len(neighbors)] = neighbors
+                    neighbors = padded
+                # 如果超过100，截断
+                elif len(neighbors) > 100:
+                    neighbors = neighbors[:100]
+            all_neighbors.append(neighbors)
+
+        all_neighbors = np.array(all_neighbors)
+        recall_10 = gt_eval.compute_recall(all_neighbors, k_eval=10)
+        avg_time = np.mean(search_times) * 1000
+
+        detailed_results[num_entries][ef_search] = {
+            'recall_10': recall_10,
+            'avg_time_ms': avg_time
+        }
+
+# 直接使用实际测量的latency（不插值）
+print("   整理数据（使用实际latency，不插值）...")
+
+latency_recall_data = {}
+
+for num_entries in entry_point_values:
+    latencies = []
+    recalls = []
+
+    for ef_search in ef_search_values:
+        latencies.append(
+            detailed_results[num_entries][ef_search]['avg_time_ms'])
+        recalls.append(detailed_results[num_entries][ef_search]['recall_10'])
+
+    sorted_pairs = sorted(zip(latencies, recalls))
+    sorted_latencies = [p[0] for p in sorted_pairs]
+    sorted_recalls = [p[1] for p in sorted_pairs]
+
+    latency_recall_data[num_entries] = {
+        'latencies': sorted_latencies,
+        'recalls': sorted_recalls
+    }
 
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
 sns.set_style("whitegrid")
+
+# 生成Latency vs Recall图（使用实际latency）
+plt.figure(figsize=(14, 8))
+
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
+          '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p']
+
+for i, num_entries in enumerate(entry_point_values):
+    latencies = latency_recall_data[num_entries]['latencies']
+    recalls = latency_recall_data[num_entries]['recalls']
+
+    plt.plot(latencies, recalls,
+             marker=markers[i], linewidth=2.5, markersize=8,
+             label=f'{num_entries} Entry Points', color=colors[i])
+
+plt.xlabel('Query Latency (ms)', fontsize=14, fontweight='bold')
+plt.ylabel('Recall@10', fontsize=14, fontweight='bold')
+plt.title('HNSW: Recall@10 vs Latency for Different Entry Point Configurations (Actual)',
+          fontsize=16, fontweight='bold', pad=20)
+plt.legend(fontsize=11, loc='best', frameon=True, shadow=True, ncol=2)
+plt.grid(True, alpha=0.4, linestyle='--')
+
+# 动态计算x轴范围
+all_latencies = []
+for num_entries in entry_point_values:
+    all_latencies.extend(latency_recall_data[num_entries]['latencies'])
+min_lat = min(all_latencies)
+max_lat = max(all_latencies)
+plt.xlim([min_lat - 2, max_lat + 2])
+plt.ylim([0, 1.05])
+
+plt.tight_layout()
+plt.savefig('/root/code/vectordbindexing/hnsw_optimization/hnsw_latency_vs_recall.png',
+            dpi=300, bbox_inches='tight')
+print("   ✓ 主图已保存: hnsw_latency_vs_recall.png")
+plt.close()
+
+# 准备其他图表的数据
+x_values = entry_point_values
+hnsw_recall_10 = [hnsw_results[n]['recall_10'] for n in entry_point_values]
+hnsw_recall_100 = [hnsw_results[n]['recall_100'] for n in entry_point_values]
+hnsw_latency = [hnsw_results[n]['avg_time_ms'] for n in entry_point_values]
 
 # 图1: Recall@10 对比
 fig1, ax1 = plt.subplots(figsize=(12, 7))
