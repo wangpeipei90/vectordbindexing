@@ -133,18 +133,12 @@ class HNSWWithBridgesOptimized:
         n = len(self.vector_ids)
         ml = 1.0 / np.log(self.M)
 
-        # 安全检查：数据规模太大时警告
-        if n > 1000000:
-            logger.warning(f"⚠️ 数据规模很大 ({n})，建议使用 <= 500K 数据进行测试")
-
         # 批量处理以提高效率
         for idx, vid in enumerate(self.vector_ids):
             if idx % 100000 == 0 and idx > 0:
                 logger.info(f"  处理进度: {idx}/{n} ({100*idx/n:.1f}%)")
 
-            self.rng.seed(self.seed + int(vid))
-            level = int(-np.log(self.rng.uniform(0.001, 1.0)) * ml)
-            level = min(level, 16)
+            level = self.index.get_level(vid)
 
             if level >= 1:
                 if level not in self.high_layer_nodes:
@@ -177,14 +171,6 @@ class HNSWWithBridgesOptimized:
             logger.warning(
                 f"高层节点数({len(all_high_nodes)}) < 簇数({self.n_clusters})，跳过桥接边添加")
             return
-
-        # 安全检查：高层节点太多时随机采样
-        if len(all_high_nodes) > 50000:
-            logger.warning(
-                f"⚠️ 高层节点过多 ({len(all_high_nodes)})，随机采样 50000 个以避免内存溢出")
-            sampled_indices = self.rng.choice(
-                len(all_high_nodes), 50000, replace=False)
-            all_high_nodes = [all_high_nodes[i] for i in sampled_indices]
 
         all_high_nodes = np.array(all_high_nodes)
 
@@ -240,8 +226,7 @@ class HNSWWithBridgesOptimized:
                 for rep_i in reps_i:
                     for rep_j in reps_j:
                         # 添加双向桥接边
-                        self.bridge_edges[rep_i].append(rep_j)
-                        self.bridge_edges[rep_j].append(rep_i)
+                        self.index.add_link(rep_i, rep_j, 1)
                         total_bridges += 1
 
         logger.info(f"总共添加 {total_bridges} 条桥接边")
@@ -300,50 +285,105 @@ class HNSWWithBridgesOptimized:
         highest_layer = max(self.high_layer_nodes.keys()
                             ) if self.high_layer_nodes else 0
 
-        if highest_layer == 0 or len(self.high_layer_nodes[highest_layer]) < num_entry_points:
-            # 退回到标准搜索
+        if highest_layer == 0:
+            # 没有高层节点，使用标准搜索
             neighbors, _ = self.index.knn_query(
                 query.reshape(1, -1).astype(np.float32), k=k
             )
             return neighbors[0], ef_search
 
-        # 选择入口点（选择与查询最近的几个高层节点）
-        high_nodes = np.array(self.high_layer_nodes[highest_layer])
-        high_vectors = self.vectors[high_nodes]
-
-        # 计算距离
-        distances = np.linalg.norm(high_vectors - query, axis=1)
-        entry_indices = np.argsort(distances)[:num_entry_points]
-        entry_points = high_nodes[entry_indices]
-
-        # 从每个入口点搜索
+        # 第一阶段：从最高层开始向下搜索到第1层（使用较大的ef_search）
+        # 使用较大的搜索宽度以在高层获得更多候选
+        ef_high_layer = 32 * num_entry_points
+        original_ef = self.index.get_ef()
+        self.index.set_ef(ef_high_layer)
+        
+        try:
+            # 从最高层的入口点开始搜索
+            # 注意：hnswlib会自动执行从高层到低层的搜索
+            # 我们先获得一个较大的候选集
+            search_k = min(ef_high_layer, len(self.vector_ids))
+            neighbors, distances = self.index.knn_query(
+                query.reshape(1, -1).astype(np.float32), 
+                k=search_k
+            )
+            
+            # 筛选出属于layer >= 1的节点作为第0层搜索的入口点
+            high_layer_candidates = []
+            high_layer_distances = []
+            
+            for neighbor, dist in zip(neighbors[0], distances[0]):
+                try:
+                    node_level = self.index.get_level(int(neighbor))
+                    if node_level >= 1:
+                        high_layer_candidates.append(neighbor)
+                        high_layer_distances.append(dist)
+                except:
+                    continue
+            
+            # 如果找到的高层节点不够，使用所有找到的
+            if len(high_layer_candidates) == 0:
+                self.index.set_ef(original_ef)
+                neighbors, _ = self.index.knn_query(
+                    query.reshape(1, -1).astype(np.float32), k=k
+                )
+                return neighbors[0], ef_search
+            
+            # 选择top-k个高层候选作为第0层的入口点
+            high_layer_candidates = np.array(high_layer_candidates)
+            high_layer_distances = np.array(high_layer_distances)
+            
+            top_k_high_layer = min(num_entry_points, len(high_layer_candidates))
+            top_indices = np.argsort(high_layer_distances)[:top_k_high_layer]
+            entry_points_for_layer0 = high_layer_candidates[top_indices]
+            
+            logger.debug(f"高层搜索完成(ef={ef_high_layer})，从{len(high_layer_candidates)}个layer>=1节点中选择了{len(entry_points_for_layer0)}个入口点")
+            
+        finally:
+            # 恢复原始ef
+            self.index.set_ef(original_ef)
+        
+        # 第二阶段：从选定的top-k节点同时在第0层开始搜索
         all_candidates = {}
-        per_entry_k = min(k * 2, ef_search)
-
-        for entry in entry_points:
+        per_entry_k = min(k * 3, ef_search)
+        
+        for entry in entry_points_for_layer0:
             try:
+                # 从这个入口点开始搜索（会在第0层展开）
                 neighbors, distances = self.index.knn_query(
                     self.vectors[entry].reshape(1, -1),
                     k=per_entry_k
                 )
-
+                
+                # 收集候选节点及其到查询向量的真实距离
                 for neighbor, dist in zip(neighbors[0], distances[0]):
                     true_dist = np.linalg.norm(self.vectors[neighbor] - query)
                     if neighbor not in all_candidates or true_dist < all_candidates[neighbor]:
                         all_candidates[neighbor] = true_dist
-
+                        
             except Exception as e:
-                logger.warning(f"多入口搜索出错: {e}")
+                logger.warning(f"第0层搜索出错 (entry={entry}): {e}")
                 continue
-
+        
+        # 如果没有找到足够的候选节点，补充标准搜索结果
+        if len(all_candidates) < k:
+            logger.warning(f"多入口搜索只找到 {len(all_candidates)} 个候选，补充标准搜索")
+            neighbors, _ = self.index.knn_query(
+                query.reshape(1, -1).astype(np.float32), k=k
+            )
+            for neighbor in neighbors[0]:
+                if neighbor not in all_candidates:
+                    true_dist = np.linalg.norm(self.vectors[neighbor] - query)
+                    all_candidates[neighbor] = true_dist
+        
         # 排序并返回 top-k
         sorted_candidates = sorted(all_candidates.items(), key=lambda x: x[1])
         result_neighbors = np.array(
             [n for n, _ in sorted_candidates[:k]], dtype=np.int32)
-
-        # 估算成本
-        cost = ef_search * num_entry_points // 2
-
+        
+        # 估算成本：高层搜索 + 第0层多入口搜索
+        cost = ef_high_layer + (per_entry_k * len(entry_points_for_layer0))
+        
         return result_neighbors, cost
 
     def set_num_entry_points(self, num_entry_points: int):
