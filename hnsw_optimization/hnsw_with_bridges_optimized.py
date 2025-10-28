@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """
-优化版 HNSW：使用聚类策略快速添加桥接边
+优化版 HNSW：使用C++核心实现的2层图结构
 """
 
 import numpy as np
-import hnswlib
 from typing import Tuple, List, Optional, Dict
 import logging
 import time
 from collections import defaultdict
-from sklearn.cluster import MiniBatchKMeans
+
+# 导入C++核心模块
+try:
+    import hnsw_core
+    HNSW_CORE_AVAILABLE = True
+except ImportError:
+    HNSW_CORE_AVAILABLE = False
+    print("WARNING: hnsw_core C++ module not available. Please compile it first.")
 
 logger = logging.getLogger(__name__)
 
 
 class HNSWWithBridgesOptimized:
     """
-    优化版 HNSW：使用聚类策略快速添加桥接边
-
-    改进：
-    1. 使用 KMeans 聚类识别不同的簇
-    2. 在不同簇之间添加桥接边（而不是耗时的2跳检测）
-    3. num_entry_points 可以在搜索时动态调整
+    优化版 HNSW：使用C++核心实现的2层图结构
+    
+    特性：
+    1. C++核心实现（高性能）
+    2. 2层图结构（Layer0全部节点，Layer1~3-6%节点，符合标准HNSW）
+    3. 固定出度（M0和M1=M0/2）
+    4. Layer1搜索到稳定
+    5. Layer0多入口并行搜索
+    6. 返回avg_visited, mean_latency, recall@10
     """
 
     def __init__(self,
@@ -30,10 +39,6 @@ class HNSWWithBridgesOptimized:
                  ef_construction: int = 200,
                  max_elements: int = 1000000,
                  seed: int = 42,
-                 # 桥接边参数
-                 enable_bridges: bool = True,
-                 n_clusters: int = 10,  # 聚类数量
-                 bridges_per_cluster_pair: int = 5,  # 每对簇之间的桥接边数
                  # 多入口搜索参数
                  num_entry_points: int = 4):
         """
@@ -41,61 +46,48 @@ class HNSWWithBridgesOptimized:
 
         Args:
             dimension: 向量维度
-            M: HNSW 连接数
+            M: HNSW 连接数（第0层出度M0=M，第1层出度M1=M/2）
             ef_construction: 构建时搜索宽度
             max_elements: 最大元素数
             seed: 随机种子
-            enable_bridges: 是否启用桥接边
-            n_clusters: 聚类数量（用于识别不同的簇）
-            bridges_per_cluster_pair: 每对簇之间添加的桥接边数
             num_entry_points: 默认入口点数量（可在搜索时调整）
         """
+        if not HNSW_CORE_AVAILABLE:
+            raise ImportError("hnsw_core C++ module is required but not available")
+        
         self.dimension = dimension
         self.M = M
+        self.M0 = M  # 第0层出度
+        self.M1 = M // 2  # 第1层出度
         self.ef_construction = ef_construction
         self.max_elements = max_elements
         self.seed = seed
-        self.rng = np.random.RandomState(seed)
-
-        # 桥接边配置
-        self.enable_bridges = enable_bridges
-        self.n_clusters = n_clusters
-        self.bridges_per_cluster_pair = bridges_per_cluster_pair
 
         # 多入口搜索配置
         self.num_entry_points = num_entry_points
 
-        # 初始化 hnswlib 索引
-        self.index = hnswlib.Index(space='l2', dim=dimension)
-        self.index.init_index(
-            max_elements=max_elements,
-            M=M,
+        # 初始化 C++ 核心索引
+        self.index = hnsw_core.HNSW(
+            dimension=dimension,
+            M0=self.M0,
             ef_construction=ef_construction,
-            random_seed=seed
+            max_elements=max_elements,
+            seed=seed
         )
 
-        # 存储向量数据
+        # 存储向量数据（用于计算recall等）
         self.vectors: Optional[np.ndarray] = None
         self.vector_ids: Optional[np.ndarray] = None
-
-        # 桥接边映射：{node_id: [bridge_neighbor_ids]}
-        self.bridge_edges: Dict[int, List[int]] = defaultdict(list)
-
-        # 高层节点缓存：{layer: [node_ids]}
-        self.high_layer_nodes: Dict[int, List[int]] = {}
-
-        # 聚类标签
-        self.cluster_labels: Optional[np.ndarray] = None
 
         self.is_built = False
 
     def build_index(self, vectors: np.ndarray, ids: Optional[np.ndarray] = None):
         """
-        构建索引并自动添加桥接边（使用快速聚类策略）
+        构建索引
 
         Args:
             vectors: 向量数据 (N x D)
-            ids: 向量ID（可选）
+            ids: 向量ID（可选，当前版本使用0到N-1）
         """
         logger.info(f"构建优化版 HNSW 索引: {len(vectors)} 个向量")
 
@@ -105,146 +97,24 @@ class HNSWWithBridgesOptimized:
             ids = np.arange(len(vectors))
         self.vector_ids = ids.astype(np.int32)
 
-        # 1. 构建基础 HNSW 索引
+        # 构建索引（C++实现）
         start_time = time.time()
-        self.index.add_items(self.vectors, self.vector_ids)
-        self.index.set_ef(self.ef_construction)
+        self.index.build(self.vectors)
         build_time = time.time() - start_time
 
-        logger.info(f"基础 HNSW 构建完成: {build_time:.2f}秒")
-
-        # 2. 识别高层节点
-        self._identify_high_layer_nodes()
-
-        # 3. 使用快速聚类策略添加桥接边
-        if self.enable_bridges and len(self.high_layer_nodes) > 0:
-            bridge_start = time.time()
-            self._add_bridge_edges_fast()
-            bridge_time = time.time() - bridge_start
-            logger.info(f"桥接边添加完成: {bridge_time:.2f}秒")
+        logger.info(f"索引构建完成: {build_time:.2f}秒")
 
         self.is_built = True
         self._print_statistics()
 
-    def _identify_high_layer_nodes(self):
-        """识别高层节点（layer >= 1）"""
-        logger.info("识别高层节点...")
-
-        n = len(self.vector_ids)
-        ml = 1.0 / np.log(self.M)
-
-        # 批量处理以提高效率
-        for idx, vid in enumerate(self.vector_ids):
-            if idx % 100000 == 0 and idx > 0:
-                logger.info(f"  处理进度: {idx}/{n} ({100*idx/n:.1f}%)")
-
-            level = self.index.get_level(vid)
-
-            if level >= 1:
-                if level not in self.high_layer_nodes:
-                    self.high_layer_nodes[level] = []
-                self.high_layer_nodes[level].append(vid)
-
-        total_high_nodes = sum(len(nodes)
-                               for nodes in self.high_layer_nodes.values())
-        logger.info(
-            f"总高层节点: {total_high_nodes} / {n} ({100*total_high_nodes/n:.2f}%)")
-
-    def _add_bridge_edges_fast(self):
-        """
-        快速添加桥接边（使用聚类策略）
-
-        策略：
-        1. 对高层节点进行 KMeans 聚类
-        2. 识别每个簇的中心节点
-        3. 在不同簇的中心节点之间添加桥接边
-        4. 这避免了昂贵的2跳可达性检测
-        """
-        logger.info(f"使用聚类策略添加桥接边（{self.n_clusters} 个簇）")
-
-        # 收集所有高层节点
-        all_high_nodes = []
-        for layer_nodes in self.high_layer_nodes.values():
-            all_high_nodes.extend(layer_nodes)
-
-        if len(all_high_nodes) < self.n_clusters:
-            logger.warning(
-                f"高层节点数({len(all_high_nodes)}) < 簇数({self.n_clusters})，跳过桥接边添加")
-            return
-
-        all_high_nodes = np.array(all_high_nodes)
-
-        # 对高层节点进行聚类
-        logger.info(f"对 {len(all_high_nodes)} 个高层节点进行聚类...")
-        high_vectors = self.vectors[all_high_nodes]
-
-        # 使用 MiniBatchKMeans 加速（对大数据集）
-        n_clusters_actual = min(self.n_clusters, len(all_high_nodes))
-        kmeans = MiniBatchKMeans(
-            n_clusters=n_clusters_actual,
-            random_state=self.seed,
-            batch_size=min(1000, len(all_high_nodes)),
-            n_init=3
-        )
-        self.cluster_labels = kmeans.fit_predict(high_vectors)
-
-        logger.info(f"聚类完成: {n_clusters_actual} 个簇")
-
-        # 为每个簇找到代表性节点（最接近簇中心的节点）
-        cluster_representatives = {}
-        for cluster_id in range(n_clusters_actual):
-            cluster_mask = self.cluster_labels == cluster_id
-            if np.sum(cluster_mask) == 0:
-                continue
-
-            cluster_nodes = all_high_nodes[cluster_mask]
-            cluster_vectors = high_vectors[cluster_mask]
-            centroid = kmeans.cluster_centers_[cluster_id]
-
-            # 找到最接近中心的节点作为代表
-            distances = np.linalg.norm(cluster_vectors - centroid, axis=1)
-            representative_indices = np.argsort(
-                distances)[:self.bridges_per_cluster_pair]
-            representatives = cluster_nodes[representative_indices]
-
-            cluster_representatives[cluster_id] = representatives
-
-        # 在不同簇的代表节点之间添加桥接边
-        total_bridges = 0
-        for cluster_i in range(n_clusters_actual):
-            if cluster_i not in cluster_representatives:
-                continue
-
-            for cluster_j in range(cluster_i + 1, n_clusters_actual):
-                if cluster_j not in cluster_representatives:
-                    continue
-
-                # 连接两个簇的代表节点
-                reps_i = cluster_representatives[cluster_i]
-                reps_j = cluster_representatives[cluster_j]
-
-                for rep_i in reps_i:
-                    for rep_j in reps_j:
-                        # 添加双向桥接边
-                        self.index.add_link(rep_i, rep_j, 1)
-                        total_bridges += 1
-
-        logger.info(f"总共添加 {total_bridges} 条桥接边")
-
-        # 显示簇大小分布
-        logger.info("簇大小分布:")
-        for cluster_id in sorted(cluster_representatives.keys()):
-            cluster_size = np.sum(self.cluster_labels == cluster_id)
-            n_reps = len(cluster_representatives[cluster_id])
-            logger.info(f"  簇 {cluster_id}: {cluster_size} 个节点, {n_reps} 个代表")
 
     def search(self,
                query: np.ndarray,
                k: int,
                ef_search: int = 200,
-               num_entry_points: Optional[int] = None) -> Tuple[np.ndarray, int]:
+               num_entry_points: Optional[int] = None) -> Tuple[np.ndarray, Dict]:
         """
-        搜索（可动态调整入口点数量）
+        搜索（返回邻居和统计信息）
 
         Args:
             query: 查询向量 (D,)
@@ -253,138 +123,118 @@ class HNSWWithBridgesOptimized:
             num_entry_points: 入口点数量（None 则使用默认值）
 
         Returns:
-            (neighbors, cost)
+            (neighbors, stats)
+            - neighbors: 邻居ID数组
+            - stats: 统计信息字典，包含:
+                - visited_count: 访问的节点数 (avg_visited)
+                - latency_us: 搜索延迟（微秒）(mean_latency)
+                - layer1_visited: 第1层访问的节点数
+                - layer0_visited: 第0层访问的节点数
         """
         if not self.is_built:
             raise ValueError("索引未构建")
 
-        self.index.set_ef(ef_search)
-
         # 使用提供的或默认的入口点数量
         n_entries = num_entry_points if num_entry_points is not None else self.num_entry_points
 
-        if n_entries <= 1 or not self.high_layer_nodes:
-            # 标准单入口搜索
-            neighbors, _ = self.index.knn_query(
-                query.reshape(1, -1).astype(np.float32), k=k
-            )
-            return neighbors[0], ef_search
+        # 调用C++搜索
+        result = self.index.search(
+            query.astype(np.float32),
+            k=k,
+            ef_search=ef_search,
+            num_entry_points=n_entries
+        )
 
-        # 多入口搜索
-        return self._multi_entry_search(query, k, ef_search, n_entries)
+        # 返回邻居和统计信息
+        neighbors = result['neighbors']
+        stats = {
+            'visited_count': result['visited_count'],
+            'latency_us': result['latency_us'],
+            'layer1_visited': result['layer1_visited'],
+            'layer0_visited': result['layer0_visited'],
+        }
 
-    def _multi_entry_search(self,
-                            query: np.ndarray,
-                            k: int,
-                            ef_search: int,
-                            num_entry_points: int) -> Tuple[np.ndarray, int]:
+        return neighbors, stats
+
+    def batch_search(self,
+                     queries: np.ndarray,
+                     k: int,
+                     ef_search: int = 200,
+                     num_entry_points: Optional[int] = None) -> Tuple[np.ndarray, Dict]:
         """
-        多入口点搜索
+        批量搜索
+
+        Args:
+            queries: 查询向量 (N x D)
+            k: 返回的邻居数量
+            ef_search: 搜索宽度
+            num_entry_points: 入口点数量
+
+        Returns:
+            (all_neighbors, aggregated_stats)
+            - all_neighbors: 所有查询的邻居 (N x k)
+            - aggregated_stats: 聚合统计信息
         """
-        # 找到最高层的节点
-        highest_layer = max(self.high_layer_nodes.keys()
-                            ) if self.high_layer_nodes else 0
+        if not self.is_built:
+            raise ValueError("索引未构建")
 
-        if highest_layer == 0:
-            # 没有高层节点，使用标准搜索
-            neighbors, _ = self.index.knn_query(
-                query.reshape(1, -1).astype(np.float32), k=k
-            )
-            return neighbors[0], ef_search
+        n_entries = num_entry_points if num_entry_points is not None else self.num_entry_points
 
-        # 第一阶段：从最高层开始向下搜索到第1层（使用较大的ef_search）
-        # 使用较大的搜索宽度以在高层获得更多候选
-        ef_high_layer = 32 * num_entry_points
-        original_ef = self.index.get_ef()
-        self.index.set_ef(ef_high_layer)
-        
-        try:
-            # 从最高层的入口点开始搜索
-            # 注意：hnswlib会自动执行从高层到低层的搜索
-            # 我们先获得一个较大的候选集
-            search_k = min(ef_high_layer, len(self.vector_ids))
-            neighbors, distances = self.index.knn_query(
-                query.reshape(1, -1).astype(np.float32), 
-                k=search_k
-            )
-            
-            # 筛选出属于layer >= 1的节点作为第0层搜索的入口点
-            high_layer_candidates = []
-            high_layer_distances = []
-            
-            for neighbor, dist in zip(neighbors[0], distances[0]):
-                try:
-                    node_level = self.index.get_level(int(neighbor))
-                    if node_level >= 1:
-                        high_layer_candidates.append(neighbor)
-                        high_layer_distances.append(dist)
-                except:
-                    continue
-            
-            # 如果找到的高层节点不够，使用所有找到的
-            if len(high_layer_candidates) == 0:
-                self.index.set_ef(original_ef)
-                neighbors, _ = self.index.knn_query(
-                    query.reshape(1, -1).astype(np.float32), k=k
-                )
-                return neighbors[0], ef_search
-            
-            # 选择top-k个高层候选作为第0层的入口点
-            high_layer_candidates = np.array(high_layer_candidates)
-            high_layer_distances = np.array(high_layer_distances)
-            
-            top_k_high_layer = min(num_entry_points, len(high_layer_candidates))
-            top_indices = np.argsort(high_layer_distances)[:top_k_high_layer]
-            entry_points_for_layer0 = high_layer_candidates[top_indices]
-            
-            logger.debug(f"高层搜索完成(ef={ef_high_layer})，从{len(high_layer_candidates)}个layer>=1节点中选择了{len(entry_points_for_layer0)}个入口点")
-            
-        finally:
-            # 恢复原始ef
-            self.index.set_ef(original_ef)
-        
-        # 第二阶段：从选定的top-k节点同时在第0层开始搜索
-        all_candidates = {}
-        per_entry_k = min(k * 3, ef_search)
-        
-        for entry in entry_points_for_layer0:
-            try:
-                # 从这个入口点开始搜索（会在第0层展开）
-                neighbors, distances = self.index.knn_query(
-                    self.vectors[entry].reshape(1, -1),
-                    k=per_entry_k
-                )
-                
-                # 收集候选节点及其到查询向量的真实距离
-                for neighbor, dist in zip(neighbors[0], distances[0]):
-                    true_dist = np.linalg.norm(self.vectors[neighbor] - query)
-                    if neighbor not in all_candidates or true_dist < all_candidates[neighbor]:
-                        all_candidates[neighbor] = true_dist
-                        
-            except Exception as e:
-                logger.warning(f"第0层搜索出错 (entry={entry}): {e}")
-                continue
-        
-        # 如果没有找到足够的候选节点，补充标准搜索结果
-        if len(all_candidates) < k:
-            logger.warning(f"多入口搜索只找到 {len(all_candidates)} 个候选，补充标准搜索")
-            neighbors, _ = self.index.knn_query(
-                query.reshape(1, -1).astype(np.float32), k=k
-            )
-            for neighbor in neighbors[0]:
-                if neighbor not in all_candidates:
-                    true_dist = np.linalg.norm(self.vectors[neighbor] - query)
-                    all_candidates[neighbor] = true_dist
-        
-        # 排序并返回 top-k
-        sorted_candidates = sorted(all_candidates.items(), key=lambda x: x[1])
-        result_neighbors = np.array(
-            [n for n, _ in sorted_candidates[:k]], dtype=np.int32)
-        
-        # 估算成本：高层搜索 + 第0层多入口搜索
-        cost = ef_high_layer + (per_entry_k * len(entry_points_for_layer0))
-        
-        return result_neighbors, cost
+        # 调用C++批量搜索
+        results = self.index.batch_search(
+            queries.astype(np.float32),
+            k=k,
+            ef_search=ef_search,
+            num_entry_points=n_entries
+        )
+
+        # 收集所有邻居
+        all_neighbors = np.array([r['neighbors'] for r in results])
+
+        # 聚合统计信息
+        visited_counts = [r['visited_count'] for r in results]
+        latencies = [r['latency_us'] for r in results]
+        layer1_visited = [r['layer1_visited'] for r in results]
+        layer0_visited = [r['layer0_visited'] for r in results]
+
+        aggregated_stats = {
+            'avg_visited': np.mean(visited_counts),
+            'std_visited': np.std(visited_counts),
+            'mean_latency': np.mean(latencies),
+            'std_latency': np.std(latencies),
+            'avg_layer1_visited': np.mean(layer1_visited),
+            'avg_layer0_visited': np.mean(layer0_visited),
+            'all_visited_counts': visited_counts,
+            'all_latencies': latencies,
+        }
+
+        return all_neighbors, aggregated_stats
+
+    def compute_recall(self,
+                       results: np.ndarray,
+                       ground_truth: np.ndarray,
+                       k: int = 10) -> float:
+        """
+        计算recall@k
+
+        Args:
+            results: 搜索结果 (k,) 或 (N x k)
+            ground_truth: ground truth (k,) 或 (N x k)
+            k: 计算recall的k值
+
+        Returns:
+            recall值
+        """
+        if results.ndim == 1:
+            # 单个查询
+            return hnsw_core.HNSW.compute_recall(results, ground_truth, k)
+        else:
+            # 多个查询
+            recalls = []
+            for res, gt in zip(results, ground_truth):
+                recall = hnsw_core.HNSW.compute_recall(res, gt, k)
+                recalls.append(recall)
+            return np.mean(recalls)
 
     def set_num_entry_points(self, num_entry_points: int):
         """
@@ -398,43 +248,37 @@ class HNSWWithBridgesOptimized:
 
     def _print_statistics(self):
         """打印统计信息"""
+        num_nodes = self.index.get_num_nodes()
+        num_layer1 = self.index.get_num_layer1_nodes()
+        
         logger.info("=" * 60)
         logger.info("优化版 HNSW 统计:")
-        logger.info(f"  总节点数: {len(self.vector_ids)}")
+        logger.info(f"  总节点数: {num_nodes}")
         logger.info(f"  维度: {self.dimension}")
-        logger.info(f"  M: {self.M}")
+        logger.info(f"  M0 (第0层出度): {self.M0}")
+        logger.info(f"  M1 (第1层出度): {self.M1}")
         logger.info(f"  ef_construction: {self.ef_construction}")
-
-        if self.enable_bridges:
-            total_bridges = sum(len(neighbors)
-                                for neighbors in self.bridge_edges.values())
-            logger.info(f"  桥接边启用: ✓")
-            logger.info(f"  桥接边总数: {total_bridges}")
-            logger.info(f"  聚类数量: {self.n_clusters}")
-            logger.info(f"  每对簇桥接边数: {self.bridges_per_cluster_pair}")
-        else:
-            logger.info(f"  桥接边启用: ✗")
-
+        logger.info(f"  第1层节点数: {num_layer1} ({100*num_layer1/num_nodes:.1f}%)")
+        logger.info(f"  理论第1层比例: ~{100/self.M0:.1f}% (P(L>=1)=1/M0)")
         logger.info(f"  默认入口点数: {self.num_entry_points}")
+        logger.info(f"  实现方式: C++核心")
         logger.info("=" * 60)
 
     def get_statistics(self) -> dict:
         """获取详细统计信息"""
-        total_bridges = sum(len(neighbors)
-                            for neighbors in self.bridge_edges.values())
+        num_nodes = self.index.get_num_nodes()
+        num_layer1 = self.index.get_num_layer1_nodes()
 
         return {
-            'total_nodes': len(self.vector_ids) if self.vector_ids is not None else 0,
+            'total_nodes': num_nodes,
             'dimension': self.dimension,
-            'M': self.M,
+            'M0': self.M0,
+            'M1': self.M1,
             'ef_construction': self.ef_construction,
-            'enable_bridges': self.enable_bridges,
-            'total_bridges': total_bridges,
-            'n_clusters': self.n_clusters,
-            'high_layer_count': {
-                layer: len(nodes) for layer, nodes in self.high_layer_nodes.items()
-            },
+            'layer1_nodes': num_layer1,
+            'layer1_ratio': num_layer1 / num_nodes if num_nodes > 0 else 0,
             'num_entry_points': self.num_entry_points,
+            'implementation': 'C++',
         }
 
 
@@ -442,7 +286,7 @@ if __name__ == "__main__":
     # 测试
     logging.basicConfig(level=logging.INFO)
 
-    print("测试优化版 HNSW...")
+    print("测试优化版 HNSW (C++核心)...")
 
     np.random.seed(42)
     X = np.random.randn(5000, 50).astype('float32')
@@ -453,16 +297,32 @@ if __name__ == "__main__":
         dimension=50,
         M=16,
         ef_construction=100,
-        enable_bridges=True,
-        n_clusters=5,
-        bridges_per_cluster_pair=3
+        num_entry_points=4
     )
 
     hnsw.build_index(X)
 
     # 测试不同的入口点数量（无需重建）
     print("\n测试不同的入口点数量:")
+    print(f"{'num_entry':<12} {'avg_visited':<15} {'mean_latency(μs)':<18} {'neighbors':<20}")
+    print("-" * 70)
+    
     for num_entry in [1, 2, 4, 8]:
-        neighbors, cost = hnsw.search(
+        neighbors, stats = hnsw.search(
             Q[0], k=10, ef_search=50, num_entry_points=num_entry)
-        print(f"  num_entry={num_entry}: {len(neighbors)} 个邻居, 成本: {cost}")
+        print(f"{num_entry:<12} {stats['visited_count']:<15} "
+              f"{stats['latency_us']:<18.2f} {len(neighbors):<20}")
+
+    # 批量搜索
+    print("\n批量搜索测试:")
+    all_neighbors, agg_stats = hnsw.batch_search(
+        Q, k=10, ef_search=100, num_entry_points=4
+    )
+    
+    print(f"  查询数: {len(Q)}")
+    print(f"  avg_visited: {agg_stats['avg_visited']:.1f} ± {agg_stats['std_visited']:.1f}")
+    print(f"  mean_latency: {agg_stats['mean_latency']:.2f} ± {agg_stats['std_latency']:.2f} μs")
+    print(f"  avg_layer1_visited: {agg_stats['avg_layer1_visited']:.1f}")
+    print(f"  avg_layer0_visited: {agg_stats['avg_layer0_visited']:.1f}")
+
+    print("\n✅ 测试完成！")

@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC  -O3 -march=native -fopenmp -flto=auto -shared  -o /workspace/vectordbindexing/hnsw_optimization/hnsw_core.cpython-312-x86_64-linux-gnu.so CMakeFiles/hnsw_core.dir/hnsw.cpp.o CMakeFiles/hnsw_core.dir/hnsw_bindings.cpp.o
