@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 #include "hnsw.h"
 #include <vector>
+#include <iostream>
 
 namespace py = pybind11;
 
@@ -37,14 +38,31 @@ public:
         float* query_ptr = static_cast<float*>(buf.ptr);
         hnsw::SearchResult result = index_.search(query_ptr, k, ef_search, num_entry_points);
         
-        // 转换neighbors为numpy数组
-        py::array_t<int> neighbors_array(result.neighbors.size());
+        #ifdef DEBUG_SEARCH
+        std::cout << "[DEBUG] C++搜索返回 " << result.neighbors.size() << " 个邻居: ";
+        for (size_t i = 0; i < std::min((size_t)10, result.neighbors.size()); ++i) {
+            std::cout << result.neighbors[i] << " ";
+        }
+        std::cout << std::endl;
+        #endif
+        
+        // 转换neighbors为numpy数组 - 使用正确的方式创建数组
+        size_t n_neighbors = result.neighbors.size();
+        py::array_t<int> neighbors_array({n_neighbors}, {sizeof(int)});
         py::buffer_info neighbors_buf = neighbors_array.request();
         int* neighbors_ptr = static_cast<int*>(neighbors_buf.ptr);
         
-        for (size_t i = 0; i < result.neighbors.size(); ++i) {
+        for (size_t i = 0; i < n_neighbors; ++i) {
             neighbors_ptr[i] = result.neighbors[i];
         }
+        
+        #ifdef DEBUG_SEARCH
+        std::cout << "[DEBUG] 复制到numpy数组: ";
+        for (size_t i = 0; i < std::min((size_t)10, n_neighbors); ++i) {
+            std::cout << neighbors_ptr[i] << " ";
+        }
+        std::cout << std::endl;
+        #endif
         
         // 返回字典
         py::dict result_dict;
@@ -75,11 +93,13 @@ public:
         // 转换为Python list of dicts
         py::list result_list;
         for (const auto& result : results) {
-            py::array_t<int> neighbors_array(result.neighbors.size());
+            // 使用正确的方式创建数组
+            size_t n_neighbors = result.neighbors.size();
+            py::array_t<int> neighbors_array({n_neighbors}, {sizeof(int)});
             py::buffer_info neighbors_buf = neighbors_array.request();
             int* neighbors_ptr = static_cast<int*>(neighbors_buf.ptr);
             
-            for (size_t i = 0; i < result.neighbors.size(); ++i) {
+            for (size_t i = 0; i < n_neighbors; ++i) {
                 neighbors_ptr[i] = result.neighbors[i];
             }
             
@@ -134,6 +154,60 @@ public:
     
     bool is_in_layer1(int node_id) const {
         return index_.is_in_layer1(node_id);
+    }
+    
+    py::array_t<int> get_layer0_neighbors(int node_id) const {
+        std::vector<int> neighbors = index_.get_layer0_neighbors(node_id);
+        
+        py::array_t<int> result(neighbors.size());
+        py::buffer_info buf = result.request();
+        int* ptr = static_cast<int*>(buf.ptr);
+        
+        for (size_t i = 0; i < neighbors.size(); ++i) {
+            ptr[i] = neighbors[i];
+        }
+        
+        return result;
+    }
+    
+    void load_layer0(py::array_t<float> vectors, py::list neighbors_list) {
+        py::buffer_info buf = vectors.request();
+        
+        if (buf.ndim != 2) {
+            throw std::runtime_error("向量必须是2维数组 (N x D)");
+        }
+        
+        size_t num_vectors = buf.shape[0];
+        float* data = static_cast<float*>(buf.ptr);
+        
+        // 转换neighbors_list为C++ vector
+        std::vector<std::vector<int>> neighbors_vec;
+        neighbors_vec.reserve(neighbors_list.size());
+        
+        for (const auto& item : neighbors_list) {
+            py::list py_neighbors = item.cast<py::list>();
+            std::vector<int> neighbor_ids;
+            neighbor_ids.reserve(py_neighbors.size());
+            
+            for (const auto& neighbor : py_neighbors) {
+                neighbor_ids.push_back(neighbor.cast<int>());
+            }
+            
+            neighbors_vec.push_back(neighbor_ids);
+        }
+        
+        index_.load_layer0(data, num_vectors, neighbors_vec);
+    }
+    
+    void build_layer1_only(py::array_t<float> vectors) {
+        py::buffer_info buf = vectors.request();
+        
+        if (buf.ndim != 2) {
+            throw std::runtime_error("向量必须是2维数组 (N x D)");
+        }
+        
+        float* data = static_cast<float*>(buf.ptr);
+        index_.build_layer1_only(data);
     }
     
 private:
@@ -216,6 +290,21 @@ PYBIND11_MODULE(hnsw_core, m) {
              "获取节点在第1层的邻居列表")
         .def("is_in_layer1", &HNSWWrapper::is_in_layer1,
              py::arg("node_id"),
-             "检查节点是否在第1层");
+             "检查节点是否在第1层")
+        .def("get_layer0_neighbors", &HNSWWrapper::get_layer0_neighbors,
+             py::arg("node_id"),
+             "获取节点在第0层的邻居列表（用于保存图结构）")
+        .def("load_layer0", &HNSWWrapper::load_layer0,
+             py::arg("vectors"),
+             py::arg("neighbors_list"),
+             "从预加载数据加载第0层图结构\n\n"
+             "参数:\n"
+             "  vectors: numpy数组 (N x D)\n"
+             "  neighbors_list: Python列表的列表，每个子列表包含一个节点的第0层邻居ID")
+        .def("build_layer1_only", &HNSWWrapper::build_layer1_only,
+             py::arg("vectors"),
+             "只构建第1层（假设第0层已经加载）\n\n"
+             "参数:\n"
+             "  vectors: numpy数组 (N x D)");
 }
 

@@ -4,18 +4,13 @@
 """
 
 import numpy as np
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, Optional, Dict
 import logging
 import time
-from collections import defaultdict
 
 # 导入C++核心模块
-try:
-    import hnsw_core
-    HNSW_CORE_AVAILABLE = True
-except ImportError:
-    HNSW_CORE_AVAILABLE = False
-    print("WARNING: hnsw_core C++ module not available. Please compile it first.")
+import hnsw_core
+HNSW_CORE_AVAILABLE = True
 
 logger = logging.getLogger(__name__)
 
@@ -81,28 +76,59 @@ class HNSWWithBridgesOptimized:
 
         self.is_built = False
 
-    def build_index(self, vectors: np.ndarray, ids: Optional[np.ndarray] = None):
+    def build_index(self, vectors: np.ndarray, ids: Optional[np.ndarray] = None, 
+                    rebuild_graph_from: str = "", load_from_roargraph: str = ""):
         """
         构建索引
 
         Args:
             vectors: 向量数据 (N x D)
             ids: 向量ID（可选，当前版本使用0到N-1）
+            rebuild_graph_from: 图结构文件路径（可选，txt格式）
+                - 如果为空：正常构建索引
+                - 如果不为空：从txt文件加载图结构
+            load_from_roargraph: RoarGraph index文件路径（可选）
+                - 如果不为空：从RoarGraph index文件加载第0层
         """
-        logger.info(f"构建优化版 HNSW 索引: {len(vectors)} 个向量")
-
         # 保存向量数据
         self.vectors = vectors.astype(np.float32)
         if ids is None:
             ids = np.arange(len(vectors))
         self.vector_ids = ids.astype(np.int32)
 
-        # 构建索引（C++实现）
-        start_time = time.time()
-        self.index.build(self.vectors)
-        build_time = time.time() - start_time
+        layer0_loaded = False
+        
+        if load_from_roargraph:
+            # 从RoarGraph index文件加载第0层
+            logger.info(f"从RoarGraph文件加载第0层: {load_from_roargraph}")
+            start_time = time.time()
+            self.load_layer0_from_roargraph(load_from_roargraph)
+            load_time = time.time() - start_time
+            logger.info(f"第0层加载完成: {load_time:.2f}秒")
+            layer0_loaded = True
+        elif rebuild_graph_from:
+            # 从txt文件加载图结构
+            logger.info(f"从txt文件加载图结构: {rebuild_graph_from}")
+            start_time = time.time()
+            self.load_layer0(rebuild_graph_from)
+            load_time = time.time() - start_time
+            logger.info(f"图结构加载完成: {load_time:.2f}秒")
+            layer0_loaded = True
 
-        logger.info(f"索引构建完成: {build_time:.2f}秒")
+        if layer0_loaded:
+            # 第0层已加载，只构建第1层
+            logger.info("开始构建第1层...")
+            start_time = time.time()
+            self.index.build_layer1_only(self.vectors)
+            build_time = time.time() - start_time
+            logger.info(f"第1层构建完成: {build_time:.2f}秒")
+        else:
+            # 正常构建索引（第0层和第1层）
+            logger.info(f"构建优化版 HNSW 索引: {len(vectors)} 个向量")
+            start_time = time.time()
+            self.index.build(self.vectors)
+            build_time = time.time() - start_time
+            logger.info(f"索引构建完成: {build_time:.2f}秒")
 
         self.is_built = True
         self._print_statistics()
@@ -280,6 +306,164 @@ class HNSWWithBridgesOptimized:
             'num_entry_points': self.num_entry_points,
             'implementation': 'C++',
         }
+
+    def save_layer0(self, filepath: str):
+        """
+        保存第0层图结构到文件
+
+        格式：每行一个节点
+        id \t vector \t neighbor1,neighbor2,...
+
+        Args:
+            filepath: 保存路径
+        """
+        if not self.is_built:
+            raise ValueError("索引未构建，无法保存")
+
+        logger.info(f"保存第0层图结构到: {filepath}")
+        start_time = time.time()
+
+        with open(filepath, 'w') as f:
+            num_nodes = self.index.get_num_nodes()
+            
+            for node_id in range(num_nodes):
+                # 获取向量
+                vector = self.vectors[node_id]
+                
+                # 获取第0层邻居
+                neighbors = self.index.get_layer0_neighbors(node_id)
+                
+                # 格式化输出
+                vector_str = ','.join(map(str, vector))
+                neighbors_str = ','.join(map(str, neighbors))
+                
+                f.write(f"{node_id}\t{vector_str}\t{neighbors_str}\n")
+
+        save_time = time.time() - start_time
+        logger.info(f"第0层图结构保存完成: {save_time:.2f}秒")
+
+    def load_layer0(self, filepath: str):
+        """
+        从文件加载第0层图结构
+
+        Args:
+            filepath: 文件路径
+        """
+        logger.info(f"加载第0层图结构: {filepath}")
+        start_time = time.time()
+
+        # 准备数据结构
+        node_vectors = []
+        node_neighbors = []
+
+        with open(filepath, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                if len(parts) != 3:
+                    continue
+                
+                node_id = int(parts[0])
+                vector = np.array([float(x) for x in parts[1].split(',')])
+                neighbors = [int(x) for x in parts[2].split(',') if x]
+                
+                node_vectors.append(vector)
+                node_neighbors.append(neighbors)
+
+        # 调用C++加载方法
+        node_vectors_array = np.array(node_vectors, dtype=np.float32)
+        self.index.load_layer0(node_vectors_array, node_neighbors)
+
+        load_time = time.time() - start_time
+        logger.info(f"第0层图结构加载完成: {load_time:.2f}秒，共{len(node_vectors)}个节点")
+
+    def load_layer0_from_roargraph(self, filepath: str):
+        """
+        从RoarGraph index文件加载第0层图结构
+        
+        注意：RoarGraph index 只存储图结构（邻接表），不存储向量数据
+        向量数据必须通过 build_index() 的 vectors 参数提供
+        
+        Args:
+            filepath: RoarGraph index文件路径
+        """
+        import struct
+        
+        logger.info(f"从RoarGraph文件加载第0层图结构: {filepath}")
+        start_time = time.time()
+        
+        if self.vectors is None:
+            raise ValueError("必须先通过 build_index() 提供向量数据才能加载图结构")
+        
+        node_neighbors = []
+        
+        with open(filepath, 'rb') as f:
+            # RoarGraph 格式（基于实际文件分析）:
+            # - 字节 0-3:  元数据（跳过）
+            # - 字节 4-7:  节点总数 ✅
+            # - 字节 8开始: 每个节点的邻居列表
+            #   - 4字节: 邻居数量
+            #   - N*4字节: N个邻居ID
+            
+            # 读取头部
+            metadata = struct.unpack('I', f.read(4))[0]  # 字节0-3: 元数据（跳过）
+            num_nodes_in_file = struct.unpack('I', f.read(4))[0]  # 字节4-7: 节点总数
+            
+            logger.info(f"RoarGraph文件信息: 节点数={num_nodes_in_file:,}, 元数据={metadata:,}")
+            
+            if num_nodes_in_file != len(self.vectors):
+                logger.warning(f"节点数不匹配: 文件中 {num_nodes_in_file}, 向量数据 {len(self.vectors)}")
+                # 使用较小的值
+                num_nodes = min(num_nodes_in_file, len(self.vectors))
+            else:
+                num_nodes = num_nodes_in_file
+            
+            # 读取每个节点的邻居列表
+            logger.info(f"开始读取 {num_nodes} 个节点的邻居列表...")
+            invalid_neighbor_count = 0
+            
+            for node_id in range(num_nodes):
+                # 读取邻居数量
+                num_neighbors_bytes = f.read(4)
+                if len(num_neighbors_bytes) < 4:
+                    logger.warning(f"节点 {node_id} 读取邻居数量失败，使用空邻居列表")
+                    node_neighbors.append([])
+                    continue
+                    
+                num_neighbors = struct.unpack('I', num_neighbors_bytes)[0]
+                
+                # 读取邻居ID列表
+                if num_neighbors > 0:
+                    neighbors_bytes = f.read(num_neighbors * 4)
+                    if len(neighbors_bytes) < num_neighbors * 4:
+                        logger.warning(f"节点 {node_id} 邻居数据不完整")
+                        neighbors = []
+                    else:
+                        raw_neighbors = list(struct.unpack(f'{num_neighbors}I', neighbors_bytes))
+                        
+                        # 🔧 修复：过滤掉超出范围的邻居ID
+                        neighbors = []
+                        for nid in raw_neighbors:
+                            if nid < num_nodes:
+                                neighbors.append(nid)
+                            else:
+                                invalid_neighbor_count += 1
+                else:
+                    neighbors = []
+                
+                node_neighbors.append(neighbors)
+                
+                if (node_id + 1) % 100000 == 0:
+                    logger.info(f"  进度: {node_id + 1}/{num_nodes}")
+            
+            if invalid_neighbor_count > 0:
+                logger.warning(f"过滤掉 {invalid_neighbor_count} 个超出范围的邻居ID")
+        
+        # 调用C++加载方法（使用已有的向量数据）
+        logger.info(f"加载完成，共 {len(node_neighbors)} 个节点的邻接表")
+        self.index.load_layer0(self.vectors, node_neighbors)
+        
+        load_time = time.time() - start_time
+        logger.info(f"第0层从RoarGraph加载完成: {load_time:.2f}秒")
 
 
 if __name__ == "__main__":
