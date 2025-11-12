@@ -10,8 +10,18 @@ namespace py = pybind11;
 class HNSWWrapper {
 public:
     HNSWWrapper(size_t dimension, size_t M0, size_t ef_construction, 
-                        size_t max_elements, int seed = 42)
-        : index_(dimension, M0, ef_construction, max_elements, seed) {}
+                        size_t max_elements, const std::string& distance_type = "l2", int seed = 42)
+        : index_(dimension, M0, ef_construction, max_elements, parse_distance_type(distance_type), seed) {}
+    
+    static hnsw::DistanceType parse_distance_type(const std::string& dt) {
+        if (dt == "ip" || dt == "IP") {
+            return hnsw::DistanceType::IP;
+        } else if (dt == "l2" || dt == "L2") {
+            return hnsw::DistanceType::L2;
+        } else {
+            throw std::runtime_error("不支持的距离类型: " + dt + "，请使用 'l2' 或 'ip'");
+        }
+    }
     
     void build(py::array_t<float> vectors) {
         py::buffer_info buf = vectors.request();
@@ -218,11 +228,12 @@ PYBIND11_MODULE(hnsw_core, m) {
     m.doc() = "2层HNSW索引的C++核心实现";
     
     py::class_<HNSWWrapper>(m, "HNSW")
-        .def(py::init<size_t, size_t, size_t, size_t, int>(),
+        .def(py::init<size_t, size_t, size_t, size_t, const std::string&, int>(),
              py::arg("dimension"),
              py::arg("M0"),
              py::arg("ef_construction"),
              py::arg("max_elements"),
+             py::arg("distance_type") = "l2",
              py::arg("seed") = 42,
              "创建2层HNSW索引\n\n"
              "参数:\n"

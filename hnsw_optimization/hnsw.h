@@ -18,6 +18,72 @@
 
 namespace hnsw {
 
+// 距离类型枚举
+enum class DistanceType {
+    L2,        // L2 距离（欧氏距离）
+    IP,        // IP 距离（内积，注意：值越大越相似，需要取负）
+    COSINE     // 余弦距离
+};
+
+// 内积距离函数 - ✅ 优化版本with SIMD
+// 注意：返回负内积（因为HNSW用小值表示近）
+inline float ip_distance(const float* a, const float* b, size_t dim) {
+    float dot = 0.0f;
+    
+#ifdef __AVX__
+    // AVX优化（8个float同时计算）
+    __m256 sum = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+    }
+    
+    // 水平求和
+    float temp[8];
+    _mm256_storeu_ps(temp, sum);
+    dot = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
+    
+    // 处理剩余元素
+    for (; i < dim; ++i) {
+        dot += a[i] * b[i];
+    }
+#elif defined(__SSE__)
+    // SSE优化（4个float同时计算）
+    __m128 sum = _mm_setzero_ps();
+    size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        __m128 va = _mm_loadu_ps(a + i);
+        __m128 vb = _mm_loadu_ps(b + i);
+        sum = _mm_add_ps(sum, _mm_mul_ps(va, vb));
+    }
+    
+    // 水平求和
+    float temp[4];
+    _mm_storeu_ps(temp, sum);
+    dot = temp[0] + temp[1] + temp[2] + temp[3];
+    
+    // 处理剩余元素
+    for (; i < dim; ++i) {
+        dot += a[i] * b[i];
+    }
+#else
+    // 标准实现（带循环展开）
+    size_t i = 0;
+    // 4-way unrolling
+    for (; i + 4 <= dim; i += 4) {
+        dot += a[i] * b[i] + a[i+1] * b[i+1] + a[i+2] * b[i+2] + a[i+3] * b[i+3];
+    }
+    // 处理剩余元素
+    for (; i < dim; ++i) {
+        dot += a[i] * b[i];
+    }
+#endif
+    
+    return -dot;  // 返回负值，因为HNSW中小值表示近
+}
+
 // 距离计算函数（L2距离）- ✅ 优化版本with SIMD
 inline float l2_distance(const float* a, const float* b, size_t dim) {
     float dist = 0.0f;
@@ -124,7 +190,8 @@ struct SearchState {
  */
 class HNSW {
 public:
-    HNSW(size_t dimension, size_t M0, size_t ef_construction, size_t max_elements, int seed = 42);
+    HNSW(size_t dimension, size_t M0, size_t ef_construction, size_t max_elements, 
+         DistanceType distance_type = DistanceType::L2, int seed = 42);
     ~HNSW();
     
     // 构建索引
@@ -205,6 +272,7 @@ private:
     size_t ef_construction_;
     size_t max_elements_;
     float ml_;  // 层级选择参数
+    DistanceType distance_type_;  // 距离类型
     
     // 数据
     float* data_;  // 向量数据 [num_elements * dimension]

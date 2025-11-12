@@ -33,6 +33,7 @@ class HNSWWithBridgesOptimized:
                  M: int = 32,
                  ef_construction: int = 200,
                  max_elements: int = 1000000,
+                 distance_type: str = "l2",
                  seed: int = 42,
                  # 多入口搜索参数
                  num_entry_points: int = 4):
@@ -56,6 +57,7 @@ class HNSWWithBridgesOptimized:
         self.M1 = M // 2  # 第1层出度
         self.ef_construction = ef_construction
         self.max_elements = max_elements
+        self.distance_type = distance_type
         self.seed = seed
 
         # 多入口搜索配置
@@ -67,6 +69,7 @@ class HNSWWithBridgesOptimized:
             M0=self.M0,
             ef_construction=ef_construction,
             max_elements=max_elements,
+            distance_type=distance_type,
             seed=seed
         )
 

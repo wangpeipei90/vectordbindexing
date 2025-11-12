@@ -8,10 +8,10 @@
 namespace hnsw {
 
 HNSW::HNSW(size_t dimension, size_t M0, size_t ef_construction, 
-                           size_t max_elements, int seed)
+                           size_t max_elements, DistanceType distance_type, int seed)
     : dimension_(dimension), M0_(M0), M1_(M0 / 2), ef_construction_(ef_construction),
-      max_elements_(max_elements), num_elements_(0), rng_(seed), level_dist_(0.0, 1.0),
-      visited_version_(1) {
+      max_elements_(max_elements), distance_type_(distance_type), num_elements_(0), 
+      rng_(seed), level_dist_(0.0, 1.0), visited_version_(1) {
     
     // 计算层级选择参数（与标准HNSW一致）
     // 标准HNSW: ml = 1/ln(M)，使得 P(level >= l) = (1/M)^l
@@ -122,15 +122,8 @@ void HNSW::connect_neighbors_layer1(int node_id, int ef) {
         return;
     }
     
-    // 🔧 调试：检查节点是否在第1层
-    if (!nodes_[node_id].in_layer1) {
-        std::cerr << "错误：节点 " << node_id << " 不在第1层但被调用！" << std::endl;
-        return;
-    }
-    
-    // 🔧 调试：检查邻居数组是否分配
-    if (nodes_[node_id].neighbors_layer1 == nullptr) {
-        std::cerr << "错误：节点 " << node_id << " 的 neighbors_layer1 未分配！" << std::endl;
+    // 安全检查：节点必须在第1层且邻居数组已分配
+    if (!nodes_[node_id].in_layer1 || nodes_[node_id].neighbors_layer1 == nullptr) {
         return;
     }
     
@@ -161,15 +154,31 @@ void HNSW::connect_neighbors_layer1(int node_id, int ef) {
         return;  // 没有可用的入口点
     }
     
+    // 安全检查：entry 必须有效且在第1层
+    if (entry < 0 || entry >= static_cast<int>(num_elements_) || 
+        !nodes_[entry].in_layer1 || nodes_[entry].neighbors_layer1 == nullptr) {
+        return;
+    }
+    
     float entry_dist = distance(entry, query);
     candidates_heap.push(Neighbor(entry, entry_dist));
     W.push(Neighbor(entry, entry_dist));
-    visited_bitmap_[entry] = current_version;
+    
+    // 安全访问 visited_bitmap_
+    if (entry < static_cast<int>(visited_bitmap_.size())) {
+        visited_bitmap_[entry] = current_version;
+    }
     
     // 贪心搜索Layer1图
     while (!candidates_heap.empty()) {
         Neighbor current = candidates_heap.top();
         candidates_heap.pop();
+        
+        // 安全检查：current.id 必须有效、在第1层且邻居数组已分配
+        if (current.id < 0 || current.id >= static_cast<int>(num_elements_) ||
+            !nodes_[current.id].in_layer1 || nodes_[current.id].neighbors_layer1 == nullptr) {
+            continue;
+        }
         
         // 提前终止条件
         if (current.distance > W.top().distance) {
@@ -179,6 +188,11 @@ void HNSW::connect_neighbors_layer1(int node_id, int ef) {
         // 扩展邻居
         int* neighbors = nodes_[current.id].neighbors_layer1;
         int num_neighbors = nodes_[current.id].num_neighbors_layer1;
+        
+        // 安全检查：邻居数必须在合理范围
+        if (num_neighbors < 0 || num_neighbors > (int)(2 * M1_)) {
+            num_neighbors = std::min(std::max(0, num_neighbors), (int)(2 * M1_));
+        }
         
         for (int i = 0; i < num_neighbors; ++i) {
             int neighbor_id = neighbors[i];
@@ -216,76 +230,69 @@ void HNSW::connect_neighbors_layer1(int node_id, int ef) {
     
     // 选择最近的M1个邻居
     size_t num_neighbors_to_add = std::min(M1_, candidates.size());
+    size_t Mmax1 = 2 * M1_;  // 数组容量 = 64
     
     for (size_t i = 0; i < num_neighbors_to_add; ++i) {
-        int neighbor_id = candidates[i].id;
-        float dist_to_neighbor = candidates[i].distance;
-        
-        // 🔧 修复：检查邻居节点是否在第1层
-        if (!nodes_[neighbor_id].in_layer1) {
-            continue;  // 跳过不在第1层的节点
+        // 安全检查：确保索引在范围内
+        if (i >= candidates.size()) {
+            break;
         }
         
-        // 🔧 关键修复：在添加边前检查并修剪
-        size_t Mmax1 = 2 * M1_;  // 64 (数组容量)
+        int neighbor_id = candidates[i].id;
         
-        // 🔧 调试：检查邻居节点的状态
+        // 检查 neighbor_id 范围和第1层状态
+        if (neighbor_id < 0 || neighbor_id >= static_cast<int>(num_elements_) ||
+            !nodes_[neighbor_id].in_layer1 || nodes_[neighbor_id].neighbors_layer1 == nullptr) {
+            continue;
+        }
+        
         Node& neighbor_node = nodes_[neighbor_id];
         
-        if (neighbor_node.neighbors_layer1 == nullptr) {
-            std::cerr << "错误：邻居节点 " << neighbor_id << " 的 neighbors_layer1 未分配！" << std::endl;
-            continue;
-        }
-        
-        // 添加正向边到当前节点
+        // 添加正向边到当前节点（检查容量）
         if (nodes_[node_id].num_neighbors_layer1 >= (int)Mmax1) {
-            // 数组满了，跳过
-            std::cerr << "警告：节点 " << node_id << " 数组已满 (" 
-                      << nodes_[node_id].num_neighbors_layer1 << "), 跳过添加邻居 " 
-                      << neighbor_id << std::endl;
-            continue;
+            continue;  // 数组满，跳过
         }
         nodes_[node_id].neighbors_layer1[nodes_[node_id].num_neighbors_layer1++] = neighbor_id;
         
-        // 🔧 核心修复：在添加反向边之前，如果数组已满，必须先修剪！
-        if (neighbor_node.num_neighbors_layer1 >= (int)Mmax1) {
-            // 数组已满 (64)，必须先修剪到 M1_ (32)
+        // 添加反向边：先修剪后添加策略
+        if (neighbor_node.num_neighbors_layer1 >= (int)M1_) {
+            // 已经有 >= M1_ 个邻居，收集所有候选并选择最近的 M1_ 个
             const float* neighbor_vec = data_ + neighbor_id * dimension_;
             
-            std::vector<Neighbor> temp_candidates;
-            // 🔧 关键：只读取有效范围内的邻居
-            int actual_count = std::min(neighbor_node.num_neighbors_layer1, (int)Mmax1);
-            temp_candidates.reserve(actual_count);
+            std::vector<Neighbor> all_candidates;
+            int safe_count = std::min(neighbor_node.num_neighbors_layer1, (int)Mmax1);
+            all_candidates.reserve(safe_count + 1);
             
-            // 收集所有现有邻居及其距离
-            for (int j = 0; j < actual_count; ++j) {
+            // 添加现有邻居
+            for (int j = 0; j < safe_count; ++j) {
                 int nn = neighbor_node.neighbors_layer1[j];
                 if (nn >= 0 && nn < static_cast<int>(num_elements_)) {
                     float dist = distance(nn, neighbor_vec);
-                    temp_candidates.push_back(Neighbor(nn, dist));
+                    all_candidates.push_back(Neighbor(nn, dist));
                 }
             }
             
-            // 部分排序并保留最近的 M1_ 个
-            if (!temp_candidates.empty()) {
-                size_t keep = std::min(M1_, temp_candidates.size());
-                if (keep < temp_candidates.size()) {
-                    std::nth_element(temp_candidates.begin(), 
-                                    temp_candidates.begin() + keep,
-                                    temp_candidates.end());
+            // 添加新邻居
+            float dist_to_new = distance(node_id, neighbor_vec);
+            all_candidates.push_back(Neighbor(node_id, dist_to_new));
+            
+            // 选择最近的 M1_ 个
+            if (!all_candidates.empty()) {
+                size_t keep = std::min(M1_, all_candidates.size());
+                if (keep < all_candidates.size()) {
+                    std::nth_element(all_candidates.begin(), 
+                                    all_candidates.begin() + keep,
+                                    all_candidates.end());
                 }
                 
+                // 更新邻居列表
                 neighbor_node.num_neighbors_layer1 = keep;
                 for (size_t j = 0; j < keep; ++j) {
-                    neighbor_node.neighbors_layer1[j] = temp_candidates[j].id;
+                    neighbor_node.neighbors_layer1[j] = all_candidates[j].id;
                 }
-            } else {
-                neighbor_node.num_neighbors_layer1 = 0;
             }
-        }
-        
-        // 现在安全地添加反向边（最后一次检查）
-        if (neighbor_node.num_neighbors_layer1 < (int)Mmax1) {
+        } else {
+            // 邻居数 < M1_，直接添加
             neighbor_node.neighbors_layer1[neighbor_node.num_neighbors_layer1++] = node_id;
         }
     }
@@ -446,7 +453,16 @@ float HNSW::distance(int node_id, const float* query) const {
     if (node_id < 0 || node_id >= static_cast<int>(num_elements_)) {
         return std::numeric_limits<float>::max();  // 返回最大距离
     }
-    return l2_distance(data_ + node_id * dimension_, query, dimension_);
+    
+    const float* node_data = data_ + node_id * dimension_;
+    
+    switch (distance_type_) {
+        case DistanceType::IP:
+            return ip_distance(node_data, query, dimension_);
+        case DistanceType::L2:
+        default:
+            return l2_distance(node_data, query, dimension_);
+    }
 }
 
 // ✅ 快速Layer1搜索（用于构建时，不等稳定）
@@ -543,48 +559,50 @@ std::vector<int> HNSW::search_layer1_stable(const float* query, size_t k, size_t
     std::priority_queue<Neighbor> top_k;  // max heap
     std::priority_queue<Neighbor, std::vector<Neighbor>, std::greater<Neighbor>> candidates;  // min heap
     
-    // 随机选择一个第1层节点作为入口
-    int entry = layer1_nodes_[rng_() % layer1_nodes_.size()];
-    float entry_dist = distance(entry, query);
+    // 🔧 修复：Query-guided多入口点选择
+    // 采样大量候选，选择距离最近的作为初始入口点
+    size_t num_samples = std::min((size_t)100, layer1_nodes_.size());  // 采样100个
+    size_t num_initial_entries = std::min((size_t)20, layer1_nodes_.size());  // 选择最近的20个
     
-    candidates.push(Neighbor(entry, entry_dist));
-    visited_bitmap_[entry] = current_version;
-    top_k.push(Neighbor(entry, entry_dist));
-    visited_count++;
+    std::vector<Neighbor> sampled_entries;
+    sampled_entries.reserve(num_samples);
+    std::unordered_set<int> sampled_set;
     
-    std::vector<int> prev_top_k;
-    int stable_rounds = 0;
-    const int required_stable_rounds = 3;  // 需要连续3轮top-k不变
+    // 采样并计算距离
+    while (sampled_set.size() < num_samples) {
+        int entry = layer1_nodes_[rng_() % layer1_nodes_.size()];
+        if (sampled_set.insert(entry).second) {
+            float entry_dist = distance(entry, query);
+            sampled_entries.push_back(Neighbor(entry, entry_dist));
+        }
+    }
     
-    // 搜索直到top-k稳定
-    while (!candidates.empty() && stable_rounds < required_stable_rounds) {
+    // 选择距离最近的 num_initial_entries 个作为初始入口点
+    std::sort(sampled_entries.begin(), sampled_entries.end());
+    for (size_t i = 0; i < std::min(num_initial_entries, sampled_entries.size()); ++i) {
+        int entry = sampled_entries[i].id;
+        float entry_dist = sampled_entries[i].distance;
+        
+        candidates.push(Neighbor(entry, entry_dist));
+        visited_bitmap_[entry] = current_version;
+        top_k.push(Neighbor(entry, entry_dist));
+        visited_count++;
+        
+        // 限制top_k大小
+        if (top_k.size() > ef_search) {
+            top_k.pop();
+        }
+    }
+    
+    // 🔧 修复：充分搜索直到 ef_search，不提前终止
+    // 移除"稳定性检查"以提高 recall
+    while (!candidates.empty()) {
         Neighbor current = candidates.top();
         candidates.pop();
         
-        // 如果当前节点比top-k中最远的还远，且候选池足够大，检查是否稳定
-        if (top_k.size() >= k && current.distance > top_k.top().distance) {
-            // 记录当前top-k
-            std::vector<int> current_top_k;
-            std::priority_queue<Neighbor> temp_top_k = top_k;
-            while (!temp_top_k.empty()) {
-                current_top_k.push_back(temp_top_k.top().id);
-                temp_top_k.pop();
-            }
-            std::sort(current_top_k.begin(), current_top_k.end());
-            
-            // 比较是否与上一轮相同
-            if (current_top_k == prev_top_k) {
-                stable_rounds++;
-            } else {
-                stable_rounds = 0;
-                prev_top_k = current_top_k;
-            }
-            
-            // 如果不够稳定，继续搜索
-            if (stable_rounds < required_stable_rounds && candidates.empty()) {
-                // 没有候选了但还不稳定，可能需要扩展搜索
-                break;
-            }
+        // 标准 HNSW 终止条件：当前候选距离大于 top-k 中最远的距离
+        if (top_k.size() >= ef_search && current.distance > top_k.top().distance) {
+            break;
         }
         
         // 检查邻居（使用新的数组结构）
@@ -870,6 +888,13 @@ void HNSW::load_layer0(const float* data, size_t num_vectors, const std::vector<
     
     num_elements_ = num_vectors;
     
+    // 🔧 关键修复：扩大 visited_bitmap_ 以匹配实际节点数
+    if (num_vectors > visited_bitmap_.size()) {
+        std::cout << "扩大 visited_bitmap_ 从 " << visited_bitmap_.size() 
+                  << " 到 " << num_vectors << std::endl;
+        visited_bitmap_.resize(num_vectors, 0);
+    }
+    
     // 复制数据
     if (data_ != nullptr) {
         delete[] data_;
@@ -946,28 +971,16 @@ void HNSW::build_layer1_only(const float* data) {
     std::cout << "第1层节点数: " << layer1_nodes_.size() << " / " << num_elements_ 
               << " (" << (100.0 * layer1_nodes_.size() / num_elements_) << "%)" << std::endl;
     
-    // 🔧 调试：检查 Mmax1 的值
-    size_t Mmax1 = 2 * M1_;
-    std::cout << "Mmax1 (数组容量) = " << Mmax1 << std::endl;
-    
     // 构建第1层连接
     for (size_t i = 0; i < layer1_nodes_.size(); ++i) {
         int node_id = layer1_nodes_[i];
         
-        // 🔧 调试：检查邻居数组是否已分配
-        if (nodes_[node_id].neighbors_layer1 == nullptr) {
-            std::cerr << "错误：节点 " << node_id << " 的 neighbors_layer1 未分配！" << std::endl;
+        // 安全检查：确保节点状态正常
+        if (!nodes_[node_id].in_layer1 || nodes_[node_id].neighbors_layer1 == nullptr) {
             continue;
         }
         
         connect_neighbors_layer1(node_id, ef_construction_);
-        
-        // 🔧 调试：检查邻居数是否越界
-        if (nodes_[node_id].num_neighbors_layer1 > (int)Mmax1) {
-            std::cerr << "警告：节点 " << node_id << " 的邻居数 (" 
-                      << nodes_[node_id].num_neighbors_layer1 << ") 超过容量 (" 
-                      << Mmax1 << ")！" << std::endl;
-        }
         
         if ((i + 1) % 1000 == 0) {
             std::cout << "  进度: " << (i + 1) << "/" << layer1_nodes_.size() << std::endl;
